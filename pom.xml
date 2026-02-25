@@ -46,7 +46,7 @@
         <kotlin.version>2.3.0</kotlin.version>
 
         <!-- Dependency versions -->
-        <cron-utils.verion>9.2.1</cron-utils.verion>
+        <cron-utils.version>9.2.1</cron-utils.version>
         <junit.version>5.10.2</junit.version>
 
         <!-- Build configuration -->
@@ -73,7 +73,7 @@
         <dependency>
             <groupId>com.cronutils</groupId>
             <artifactId>cron-utils</artifactId>
-            <version>${cron-utils.verion}</version>
+            <version>${cron-utils.version}</version>
         </dependency>
         <dependency>
             <groupId>org.jetbrains.kotlin</groupId>
