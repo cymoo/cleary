@@ -1,5 +1,7 @@
 # Cleary
 
+[中文文档](README-zh.md)
+
 A lightweight, dependency-minimal task scheduler for the JVM written in Kotlin.
 Cleary supports cron expressions, fixed-rate scheduling, one-shot tasks, retry with
 exponential backoff, and full concurrency control — all through a clean DSL with no

@@ -1,5 +1,7 @@
 # Cleary
 
+[English Documentation](README.md)
+
 Cleary 是一个使用 Kotlin 编写的轻量级的 JVM 任务调度器。  
 它支持 cron 表达式、固定频率调度、一次性任务、重试机制以及完整的并发控制——所有功能均通过简洁的 DSL
 提供，无需注解处理或反射。
