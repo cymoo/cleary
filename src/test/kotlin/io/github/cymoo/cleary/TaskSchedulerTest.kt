@@ -282,6 +282,21 @@ class TaskSchedulerTest {
         }
 
         @Test
+        @DisplayName("getTaskInfo() reports manual-only tasks without schedule metadata")
+        fun getTaskInfoForManualOnlyTask() {
+            tm = scheduler()
+            tm.task("manual-only") { run { "ok" } }
+
+            val info = tm.getTaskInfo("manual-only")
+            assertNotNull(info)
+            assertEquals("manual-only", info!!.name)
+            assertNull(info.scheduleDescription)
+            assertNull(info.nextScheduledAt)
+            assertTrue(info.enabled)
+            assertEquals(0, info.runCount)
+        }
+
+        @Test
         @DisplayName("getTaskInfo() returns null for unknown task")
         fun getTaskInfoNullForUnknown() {
             tm = scheduler()
@@ -321,6 +336,40 @@ class TaskSchedulerTest {
             tm = scheduler()
             tm.task("t") { run { error("boom") } }
             assertFailureMessage("boom", tm.runBlocking("t"))
+        }
+
+        @Test
+        @DisplayName("runBlocking() restores interrupt flag and returns Failure when interrupted")
+        fun runBlockingReturnsFailureWhenInterrupted() {
+            tm = scheduler()
+            val started = CountDownLatch(1)
+            val blocker = CountDownLatch(1)
+            val result = AtomicReference<TaskRunResult>()
+            val interruptRestored = AtomicBoolean(false)
+
+            tm.task("blocked") {
+                run {
+                    started.countDown()
+                    blocker.await(2, TimeUnit.SECONDS)
+                    "done"
+                }
+            }
+
+            val thread = Thread {
+                result.set(tm.runBlocking("blocked"))
+                interruptRestored.set(Thread.currentThread().isInterrupted)
+            }.also { it.start() }
+
+            assertTrue(started.await(2, TimeUnit.SECONDS))
+            thread.interrupt()
+            thread.join(2_000)
+
+            assertFalse(thread.isAlive)
+            val outcome = result.get()
+            assertTrue(outcome is TaskRunResult.Failure) { "Expected Failure but got $outcome" }
+            assertTrue((outcome as TaskRunResult.Failure).error is InterruptedException)
+            assertTrue(interruptRestored.get(), "interrupt flag should be restored")
+            blocker.countDown()
         }
 
         @Test
@@ -615,6 +664,42 @@ class TaskSchedulerTest {
         }
 
         @Test
+        @DisplayName("scheduled overlap is reported as Skipped with counters")
+        fun scheduledOverlapReportsSkippedOutcome() {
+            val skippedEvents = CopyOnWriteArrayList<TaskSkippedEvent>()
+            val skipped = CountDownLatch(1)
+            tm = TaskScheduler {
+                autoStart = true
+                concurrency = 2
+                onTaskSkipped = {
+                    skippedEvents.add(it)
+                    skipped.countDown()
+                }
+            }
+            val started = CountDownLatch(1)
+            val blocker = CountDownLatch(1)
+
+            tm.task("scheduled-busy") {
+                every(Duration.ofMillis(10))
+                run {
+                    started.countDown()
+                    blocker.await(2, TimeUnit.SECONDS)
+                }
+            }
+
+            assertTrue(started.await(2, TimeUnit.SECONDS))
+            awaitLatch(skipped, 2_000)
+
+            val event = skippedEvents.first()
+            assertEquals("scheduled-busy", event.taskName)
+            assertEquals(TaskExecutionType.SCHEDULED, event.executionType)
+            assertEquals(TaskSkipReason.ALREADY_RUNNING, event.reason)
+            assertNotNull(event.scheduledTime)
+            assertTrue(tm.getTaskInfo("scheduled-busy")!!.skipCount >= 1)
+            blocker.countDown()
+        }
+
+        @Test
         @DisplayName("TaskInfo reports running concurrent executions")
         fun taskInfoReportsConcurrentRunningExecutions() {
             tm = scheduler(concurrency = 2)
@@ -703,6 +788,44 @@ class TaskSchedulerTest {
             assertEquals(TaskRejectedReason.WORKER_QUEUE_FULL, (result as TaskRunResult.Rejected).reason)
             assertEquals(1, rejectedEvents.size)
             assertEquals(TaskExecutionType.MANUAL, rejectedEvents[0].executionType)
+            blocker.countDown()
+        }
+
+        @Test
+        @DisplayName("scheduled worker queue overflow is reported as Rejected with counters")
+        fun scheduledQueueOverflowReportsRejectedOutcome() {
+            val rejectedEvents = CopyOnWriteArrayList<TaskRejectedEvent>()
+            val rejected = CountDownLatch(1)
+            tm = TaskScheduler {
+                autoStart = true
+                concurrency = 1
+                queueCapacity = 1
+                onTaskRejected = {
+                    rejectedEvents.add(it)
+                    rejected.countDown()
+                }
+            }
+            val started = CountDownLatch(1)
+            val blocker = CountDownLatch(1)
+
+            tm.task("scheduled-burst") {
+                every(Duration.ofMillis(10))
+                concurrent(true)
+                run {
+                    started.countDown()
+                    blocker.await(2, TimeUnit.SECONDS)
+                }
+            }
+
+            assertTrue(started.await(2, TimeUnit.SECONDS))
+            awaitLatch(rejected, 2_000)
+
+            val event = rejectedEvents.first()
+            assertEquals("scheduled-burst", event.taskName)
+            assertEquals(TaskExecutionType.SCHEDULED, event.executionType)
+            assertEquals(TaskRejectedReason.WORKER_QUEUE_FULL, event.reason)
+            assertNotNull(event.scheduledTime)
+            assertTrue(tm.getTaskInfo("scheduled-burst")!!.rejectedCount >= 1)
             blocker.countDown()
         }
     }
@@ -946,6 +1069,27 @@ class TaskSchedulerTest {
             Thread.sleep(200)
             tm.enable("t")
             awaitLatch(latch, 2_000)
+        }
+
+        @Test
+        @DisplayName("disable() clears next scheduled time and enable() recalculates it")
+        fun disableClearsNextScheduledTimeAndEnableRestoresIt() {
+            tm = scheduler()
+            tm.task("poller") {
+                every(Duration.ofSeconds(10))
+                run { }
+            }
+
+            assertNotNull(tm.getTaskInfo("poller")!!.nextScheduledAt)
+            tm.disable("poller")
+            val disabledInfo = tm.getTaskInfo("poller")!!
+            assertFalse(disabledInfo.enabled)
+            assertNull(disabledInfo.nextScheduledAt)
+
+            tm.enable("poller")
+            val enabledInfo = tm.getTaskInfo("poller")!!
+            assertTrue(enabledInfo.enabled)
+            assertNotNull(enabledInfo.nextScheduledAt)
         }
 
         @Test

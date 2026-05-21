@@ -49,28 +49,45 @@ Cleary requires **Java 11** or later.
 ## Quick Start
 
 ```kotlin
-val tasks = TaskScheduler()
+import io.github.cymoo.cleary.*
+import java.time.Instant
 
-tasks.task("heartbeat") {
-    every(5.seconds)
-    run {
-        println("ping at ${Instant.now()}")
+fun main() {
+    val tasks = TaskScheduler {
+        registerShutdownHook = true
     }
-}
 
-tasks.task("cleanup") {
-    cron("0 0 0 * * ?")   // every day at midnight
-    retry(maxAttempts = 3, initialDelay = 1.second, backoffMultiplier = 2.0)
-    run {
-        println("running nightly cleanup")
+    tasks.task("heartbeat") {
+        every(5.seconds)
+        run {
+            println("ping at ${Instant.now()}")
+        }
     }
+
+    tasks.task("cleanup") {
+        cron("0 0 0 * * ?")   // every day at midnight
+        retry(maxAttempts = 3, initialDelay = 1.second, backoffMultiplier = 2.0)
+        run {
+            println("running nightly cleanup")
+        }
+    }
+
+    tasks.task("flush-cache") {
+        run {
+            println("manual cache flush")
+            "flushed"
+        }
+    }
+
+    tasks.start()
+
+    val result = tasks.runBlocking("flush-cache")
+    println("manual result: $result")
+
+    // Blocks until shutdown() is called. The shutdown hook makes SIGTERM / CTRL+C
+    // call shutdown() cleanly, so no Thread.sleep loop is needed.
+    tasks.await()
 }
-
-tasks.start()
-
-// Block the main thread until the JVM shuts down (SIGTERM / CTRL+C).
-// Pair with registerShutdownHook = true for a clean exit — no Thread.sleep needed.
-tasks.await()
 ```
 
 ---
@@ -278,11 +295,11 @@ val tasks = TaskScheduler {
     }
 
     onTaskSkipped = { event ->
-        logger.info("SKIP  ${event.taskName} reason=${event.reason}")
+        logger.info("SKIP  ${event.taskName} type=${event.executionType} reason=${event.reason}")
     }
 
     onTaskRejected = { event ->
-        logger.warn("REJECT ${event.taskName} reason=${event.reason}")
+        logger.warn("REJECT ${event.taskName} type=${event.executionType} reason=${event.reason}")
     }
 
     onSchedulerError = { event ->
@@ -375,13 +392,13 @@ tasks.disable("new-poller")
 // Resume
 tasks.enable("new-poller")
 
-// Permanently remove
-tasks.remove("new-poller")
-
 // Inspect
 println(tasks.listTaskNames())
 println(tasks.getTaskInfo("new-poller"))
 println(tasks.exists("new-poller"))
+
+// Permanently remove
+tasks.remove("new-poller")
 ```
 
 `TaskInfo` includes static metadata (`scheduleDescription`, `allowConcurrent`,
@@ -395,8 +412,18 @@ timestamps, last duration/error, and success/failure/skip/reject counters).
 Any registered task (including schedule-less ones) can be triggered manually:
 
 ```kotlin
+tasks.task("flush-cache") {
+    // No schedule: this task only runs when run() or runBlocking() is called.
+    run {
+        val reason: String = getOrDefault("reason", "manual")
+        println("cache flushed ($reason)")
+        "ok"
+    }
+}
+
 // Fire-and-forget — returns a Future<TaskRunResult>
 val future = tasks.run("flush-cache")
+println(future.get())
 
 // Block until complete — returns Success, Failure, Skipped, or Rejected
 when (val result = tasks.runBlocking("flush-cache")) {
@@ -407,15 +434,20 @@ when (val result = tasks.runBlocking("flush-cache")) {
 }
 
 // Pass extra context values for this execution only
-tasks.runBlocking("generate-report", mapOf("format" to "pdf"))
+tasks.runBlocking("flush-cache", mapOf("reason" to "deploy"))
 ```
+
+Task-body exceptions are captured as `TaskRunResult.Failure`; scheduler misuse still
+fails fast, for example running before `start()` or referencing an unknown task.
 
 ---
 
 ## Lifecycle
 
 ```kotlin
-val tasks = TaskScheduler()   // autoStart = false
+val tasks = TaskScheduler {
+    registerShutdownHook = true
+}
 
 // Register tasks before starting
 tasks.task("t") { every(Duration.ofSeconds(1)); run { /* … */ } }
@@ -427,16 +459,15 @@ tasks.start()
 println(tasks.isRunning)     // true while scheduler loop is alive
 println(tasks.isTerminated)  // true after shutdown() fully completes
 
-// Graceful shutdown — waits up to 30 s for in-flight tasks
+// In a main() method, block until another thread or a shutdown hook calls shutdown().
+tasks.await()
+
+// From another signal handler, admin endpoint, or test, choose one shutdown mode:
+// Graceful shutdown — waits up to 30 s for in-flight tasks.
 tasks.shutdown()
 
-// Immediate shutdown — interrupts running tasks
+// Immediate shutdown — interrupts running tasks.
 tasks.shutdown(awaitTermination = false)
-
-// Block the calling thread until shutdown() is invoked.
-// Designed for main() — pair with registerShutdownHook = true so that
-// SIGTERM / CTRL+C triggers shutdown automatically.
-tasks.await()
 ```
 
 `start()` is idempotent while the scheduler is running, and `shutdown()` is
@@ -469,8 +500,9 @@ Test dependencies: `org.junit.jupiter` (JUnit 5).
 ## Examples
 
 For a runnable web UI example, see [`examples/task-dashboard`](examples/task-dashboard).
-It uses the Colleen web framework to provide a mission-control style dashboard for
-running, enabling, disabling, removing, and resetting demo Cleary tasks.
+It uses the Colleen web framework to provide a mission-control style dashboard with
+group tabs, task details, bounded history, and controls for running, enabling,
+disabling, removing, and resetting demo Cleary tasks.
 
 ```kotlin
 import io.github.cymoo.cleary.*
@@ -484,7 +516,9 @@ import java.time.Instant
 // =============================================================================
 
 fun quickStart() {
-    val tasks = TaskScheduler()
+    val tasks = TaskScheduler {
+        registerShutdownHook = true
+    }
 
     // Fires every 5 seconds
     tasks.task("heartbeat") {
@@ -614,6 +648,18 @@ fun observability() {
                         "nextIn=${event.nextRetryDelayMs} ms  " +
                         "error=${event.error.message}"
             )
+        }
+
+        onTaskSkipped = { event ->
+            println("[SKIP]  ${event.taskName}  type=${event.executionType} reason=${event.reason}")
+        }
+
+        onTaskRejected = { event ->
+            println("[REJECT] ${event.taskName}  type=${event.executionType} reason=${event.reason}")
+        }
+
+        onSchedulerError = { event ->
+            System.err.println("[HOOK ERROR] phase=${event.phase} task=${event.taskName}: ${event.error.message}")
         }
     }
 
