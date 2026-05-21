@@ -6,7 +6,7 @@
 
     <groupId>io.github.cymoo</groupId>
     <artifactId>cleary</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0</version>
 
     <!-- Project Information (Required for Maven Central) -->
     <name>Cleary</name>

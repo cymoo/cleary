@@ -54,7 +54,7 @@ http://localhost:8000
 
 Use the matching port if you started it with `-Dport=...`.
 
-The example project depends on `io.github.cymoo:cleary:0.1.0`. Running `mvn install`
+The example project depends on `io.github.cymoo:cleary:0.2.0`. Running `mvn install`
 from the root first ensures the dashboard consumes your local Cleary code rather than
 an older artifact from Maven Central.
 

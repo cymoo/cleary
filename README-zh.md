@@ -31,14 +31,14 @@ Cleary 是一个使用 Kotlin 编写的轻量级的 JVM 任务调度器。
 <dependency>
     <groupId>io.github.cymoo</groupId>
     <artifactId>cleary</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0</version>
 </dependency>
 ```
 
 **Gradle (Kotlin DSL)**
 
 ```kotlin
-implementation("io.github.cymoo:cleary:0.1.0")
+implementation("io.github.cymoo:cleary:0.2.0")
 ```
 
 Cleary 需要 **Java 11** 或更高版本。
