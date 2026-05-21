@@ -22,20 +22,13 @@
     </header>
 
     <main class="shell layout">
-        <section class="hero">
-            <div>
-                <p class="eyebrow">Live scheduler</p>
-                <h1>Compact task control.</h1>
-                <p class="lede">The homepage shows only operational signals. Open a task for full description, counters, retry policy, and event history.</p>
-            </div>
-            <div class="hero__status">
+        <section class="metric-strip metric-strip--dashboard" aria-label="Scheduler summary">
+            <article class="metric metric--health">
+                <span>Health</span>
                 <span id="health-dot" class="health-dot"></span>
                 <strong id="health">--</strong>
                 <small id="scheduler-state">checking scheduler</small>
-            </div>
-        </section>
-
-        <section class="metric-strip" aria-label="Scheduler summary">
+            </article>
             <article class="metric">
                 <span>Tasks</span>
                 <strong id="task-count">--</strong>
@@ -61,7 +54,6 @@
         <section class="panel">
             <div class="panel__heading">
                 <div>
-                    <p class="eyebrow">Registry</p>
                     <h2>Tasks</h2>
                 </div>
                 <div class="toolbar">
@@ -69,6 +61,8 @@
                     <button id="reset-button" class="button button--danger" type="button">Reset</button>
                 </div>
             </div>
+
+            <div id="task-tabs" class="tabs" role="tablist" aria-label="Task groups"></div>
 
             <div class="table-shell">
                 <table class="task-table">

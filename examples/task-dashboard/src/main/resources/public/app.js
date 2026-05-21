@@ -1,6 +1,7 @@
 const state = {
   tasks: [],
   currentTask: null,
+  activeGroup: null,
   toastTimer: null,
   pending: new Set(),
 };
@@ -91,6 +92,8 @@ async function loadDashboard() {
   ]);
   state.tasks = tasks;
   renderOverview(overview);
+  syncActiveGroup(tasks);
+  renderTaskTabs(tasks);
   renderTaskRows(tasks);
 }
 
@@ -114,15 +117,14 @@ function renderTaskRows(tasks) {
   const tbody = document.querySelector("#task-rows");
   const empty = document.querySelector("#empty-tasks");
   tbody.replaceChildren();
-  empty.hidden = tasks.length !== 0;
+  const groups = groupTasks(tasks);
+  const active = state.activeGroup || groups[0]?.[0] || "default";
+  const visibleTasks = groups.find(([group]) => group === active)?.[1] || [];
+  empty.hidden = visibleTasks.length !== 0;
 
-  for (const task of tasks) {
+  for (const task of visibleTasks) {
     const row = document.createElement("tr");
-    row.className = "click-row";
     row.dataset.status = task.status;
-    row.addEventListener("click", () => {
-      window.location.href = taskUrl(task.name);
-    });
 
     row.append(
       cell(taskIdentityCompact(task), "task-name-cell"),
@@ -137,13 +139,67 @@ function renderTaskRows(tasks) {
   }
 }
 
+function syncActiveGroup(tasks) {
+  const groups = groupTasks(tasks).map(([group]) => group);
+  if (!groups.length) {
+    state.activeGroup = null;
+    return;
+  }
+  if (!state.activeGroup || !groups.includes(state.activeGroup)) {
+    state.activeGroup = groups[0];
+  }
+}
+
+function renderTaskTabs(tasks) {
+  const target = document.querySelector("#task-tabs");
+  if (!target) return;
+  target.replaceChildren();
+
+  for (const [group, groupedTasks] of groupTasks(tasks)) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "tab";
+    button.role = "tab";
+    button.dataset.group = group;
+    button.setAttribute("aria-selected", String(group === state.activeGroup));
+    button.innerHTML = `<span>${group}</span><strong>${groupedTasks.length}</strong>`;
+    button.addEventListener("click", () => {
+      state.activeGroup = group;
+      renderTaskTabs(state.tasks);
+      renderTaskRows(state.tasks);
+    });
+    target.append(button);
+  }
+}
+
+function groupTasks(tasks) {
+  const groups = new Map();
+  for (const task of tasks) {
+    const group = normalizeGroup(task.group);
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(task);
+  }
+  return [...groups.entries()].sort(([a], [b]) => {
+    if (a === "default") return 1;
+    if (b === "default") return -1;
+    return a.localeCompare(b);
+  });
+}
+
+function normalizeGroup(group) {
+  const value = (group || "").trim();
+  return value || "default";
+}
+
 function taskIdentityCompact(task) {
   const wrap = document.createElement("div");
   wrap.className = "task-identity task-identity--compact";
-  const title = document.createElement("strong");
+  const title = document.createElement("a");
+  title.className = "task-link";
+  title.href = taskUrl(task.name);
   title.textContent = task.name;
   const meta = document.createElement("span");
-  meta.textContent = `${task.group}${task.allowConcurrent ? " / concurrent" : ""}${task.retry ? " / retry" : ""}`;
+  meta.textContent = `${task.allowConcurrent ? "concurrent" : "single-flight"}${task.retry ? " / retry" : ""}`;
   wrap.append(title, meta);
   return wrap;
 }
@@ -184,7 +240,6 @@ function homeActions(task) {
   wrap.append(
     actionButton("Run", task, "run", "button--primary"),
     actionButton(task.enabled ? "Pause" : "Enable", task, task.enabled ? "disable" : "enable"),
-    detailLink(task),
   );
   return wrap;
 }
@@ -198,15 +253,6 @@ function detailActions(task) {
     actionButton("Remove", task, "remove", "button--danger"),
   );
   return wrap;
-}
-
-function detailLink(task) {
-  const link = document.createElement("a");
-  link.href = taskUrl(task.name);
-  link.className = "button button--small";
-  link.textContent = "Details";
-  link.addEventListener("click", (event) => event.stopPropagation());
-  return link;
 }
 
 function actionButton(label, task, action, extraClass = "") {

@@ -78,32 +78,30 @@ fun registerDemoTasks(scheduler: TaskScheduler): List<DashboardTaskDescriptor> {
         DashboardTaskDescriptor(
             name = "heartbeat",
             description = "Publishes a fast liveness pulse so the dashboard always has fresh activity.",
-            group = "control-plane"
+            group = "core"
         ),
         DashboardTaskDescriptor(
             name = "metrics-rollup",
             description = "Aggregates a pretend shard counter and demonstrates a longer fixed-rate cadence.",
-            group = "analytics"
+            group = "core"
         ),
         DashboardTaskDescriptor(
             name = "flaky-sync",
             description = "Fails twice and succeeds on the third attempt, making retry backoff visible.",
-            group = "integrations"
+            group = "operations"
         ),
         DashboardTaskDescriptor(
             name = "nightly-cleanup",
             description = "Cron-driven cleanup lane; useful for inspecting Quartz schedule metadata.",
-            group = "maintenance"
+            group = "operations"
         ),
         DashboardTaskDescriptor(
             name = "one-shot-report",
-            description = "Runs once shortly after startup or reset to demonstrate one-shot scheduling.",
-            group = "reports"
+            description = "Runs once shortly after startup or reset to demonstrate one-shot scheduling."
         ),
         DashboardTaskDescriptor(
             name = "manual-cache-flush",
-            description = "Manual-only task; it never runs on a schedule and is triggered from the dashboard.",
-            group = "operator"
+            description = "Manual-only task; it never runs on a schedule and is triggered from the dashboard."
         )
     )
 }

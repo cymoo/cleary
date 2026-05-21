@@ -12,9 +12,10 @@ three Kotlin files:
 | `tasks.kt` | Built-in demo task registration |
 | `TaskDashboard.kt` | Reusable dashboard service, metrics, history, and API handlers |
 
-The homepage shows compact task state, health, next run, last signal, success rate,
-average duration, and bounded history capacity. Click any task for a detail page
-with the full description, counters, retry policy, timestamps, and task-specific events.
+The homepage shows compact task state under group tabs, plus health, next run,
+last signal, success rate, average duration, and bounded history capacity. Click
+a task name for a detail page with the full description, counters, retry policy,
+timestamps, and task-specific events.
 
 ## Requirements
 
@@ -59,14 +60,14 @@ an older artifact from Maven Central.
 
 ## Demo Tasks
 
-| Task | Schedule | Purpose |
-|---|---|---|
-| `heartbeat` | every 2 seconds | Frequent liveness signal |
-| `metrics-rollup` | every 7 seconds | Fixed-rate analytics rollup |
-| `flaky-sync` | every 11 seconds with retry | Retry/backoff visualization |
-| `nightly-cleanup` | Quartz cron | Cron metadata and scheduled maintenance |
-| `one-shot-report` | once after startup/reset | One-shot scheduling |
-| `manual-cache-flush` | manual only | Operator-triggered task |
+| Task | Group | Schedule | Purpose |
+|---|---|---|---|
+| `heartbeat` | core | every 2 seconds | Frequent liveness signal |
+| `metrics-rollup` | core | every 7 seconds | Fixed-rate analytics rollup |
+| `flaky-sync` | operations | every 11 seconds with retry | Retry/backoff visualization |
+| `nightly-cleanup` | operations | Quartz cron | Cron metadata and scheduled maintenance |
+| `one-shot-report` | default | once after startup/reset | One-shot scheduling |
+| `manual-cache-flush` | default | manual only | Operator-triggered task |
 
 ## API
 
