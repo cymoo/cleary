@@ -18,7 +18,8 @@ annotation processing or reflection.
 - **Retry with backoff** — constant or exponential, with a configurable cap
 - **Concurrency guard** — overlapping executions are skipped (default) or allowed per task
 - **Dynamic task management** — register, disable, enable, and remove tasks at runtime
-- **Observability hooks** — `onTaskStart`, `onTaskComplete`, `onRetry` callbacks
+- **Observable outcomes** — explicit success, failure, skipped, and rejected results
+- **Observability hooks** — task lifecycle, retry, skip, reject, and scheduler-error callbacks
 - **Shared context** — pass services and values into every task without closures
 
 ---
@@ -81,6 +82,7 @@ tasks.await()
 | Property               | Default                        | Description                                                   |
 |------------------------|--------------------------------|---------------------------------------------------------------|
 | `concurrency`          | min(32, max(4, CPU cores × 4)) | Worker thread pool size                                       |
+| `queueCapacity`        | `10_000`                       | Worker queue capacity before manual/scheduled runs reject     |
 | `threadNamePrefix`     | `"task-scheduler"`             | Prefix for all thread names                                   |
 | `autoStart`            | `false`                        | Start the scheduler immediately after construction            |
 | `registerShutdownHook` | `false`                        | Register a JVM shutdown hook that calls `shutdown()`          |
@@ -88,6 +90,9 @@ tasks.await()
 | `onTaskStart`          | `null`                         | Callback fired before each execution begins                   |
 | `onTaskComplete`       | `null`                         | Callback fired after each execution ends (success or failure) |
 | `onRetry`              | `null`                         | Callback fired after each failed attempt when retries remain  |
+| `onTaskSkipped`        | `null`                         | Callback fired when overlap protection skips an execution     |
+| `onTaskRejected`       | `null`                         | Callback fired when the worker queue rejects an execution     |
+| `onSchedulerError`     | `null`                         | Callback fired when a hook or scheduler loop throws           |
 
 ---
 
@@ -150,6 +155,9 @@ tasks.task("warmup-then-poll") {
 }
 ```
 
+For `once(at)`, the delay is added to the one-shot instant. For example,
+`once(t)` plus `initialDelay(30.seconds)` fires once at `t + 30 seconds`.
+
 ---
 
 ## Retry
@@ -179,8 +187,8 @@ tasks.task("sync") {
 ## Concurrency Control
 
 By default, only one execution of a task can run at a time. If the task is still
-running when its next slot arrives, that slot is **skipped** — no queuing, no
-backpressure.
+running when its next slot arrives, that slot is **skipped** and reported as
+`TaskRunResult.Skipped` for manual runs and `onTaskSkipped` for all runs.
 
 ```kotlin
 tasks.task("slow-report") {
@@ -268,8 +276,24 @@ val tasks = TaskScheduler {
                     "nextIn=${event.nextRetryDelayMs} ms"
         )
     }
+
+    onTaskSkipped = { event ->
+        logger.info("SKIP  ${event.taskName} reason=${event.reason}")
+    }
+
+    onTaskRejected = { event ->
+        logger.warn("REJECT ${event.taskName} reason=${event.reason}")
+    }
+
+    onSchedulerError = { event ->
+        logger.error("SCHEDULER ERROR phase=${event.phase} task=${event.taskName}", event.error)
+    }
 }
 ```
+
+Hook failures are isolated: an exception thrown from `onTaskStart`,
+`onTaskComplete`, `onRetry`, `onTaskSkipped`, or `onTaskRejected` is reported to
+`onSchedulerError` and does not change the task's execution result.
 
 ### Event fields
 
@@ -304,6 +328,34 @@ val tasks = TaskScheduler {
 | `error`            | `Throwable` | Exception from the most recent failure     |
 | `nextRetryDelayMs` | `Long`      | Sleep time before the next attempt         |
 
+**`TaskSkippedEvent`**
+
+| Field           | Type                | Description                                             |
+|-----------------|---------------------|---------------------------------------------------------|
+| `taskName`      | `String`            | Name of the task                                        |
+| `scheduledTime` | `Long?`             | Planned trigger time for scheduled runs; `null` manual |
+| `skippedAt`     | `Long`              | Wall-clock time when the skip was recorded (epoch ms)  |
+| `executionType` | `TaskExecutionType` | `SCHEDULED` or `MANUAL`                                 |
+| `reason`        | `TaskSkipReason`    | Currently `ALREADY_RUNNING`                             |
+
+**`TaskRejectedEvent`**
+
+| Field           | Type                 | Description                                             |
+|-----------------|----------------------|---------------------------------------------------------|
+| `taskName`      | `String`             | Name of the task                                        |
+| `scheduledTime` | `Long?`              | Planned trigger time for scheduled runs; `null` manual |
+| `rejectedAt`    | `Long`               | Wall-clock time when the rejection occurred (epoch ms) |
+| `executionType` | `TaskExecutionType`  | `SCHEDULED` or `MANUAL`                                 |
+| `reason`        | `TaskRejectedReason` | Currently `WORKER_QUEUE_FULL`                           |
+
+**`SchedulerErrorEvent`**
+
+| Field      | Type                  | Description                                      |
+|------------|-----------------------|--------------------------------------------------|
+| `taskName` | `String?`             | Task related to the error, when known            |
+| `phase`    | `SchedulerErrorPhase` | Callback or scheduler phase that threw           |
+| `error`    | `Throwable`           | The isolated hook or scheduler-loop exception    |
+
 ---
 
 ## Dynamic Task Management
@@ -332,6 +384,10 @@ println(tasks.getTaskInfo("new-poller"))
 println(tasks.exists("new-poller"))
 ```
 
+`TaskInfo` includes static metadata (`scheduleDescription`, `allowConcurrent`,
+`retryPolicy`) and runtime fields (`activeExecutions`, `running`, next/last
+timestamps, last duration/error, and success/failure/skip/reject counters).
+
 ---
 
 ## Manual Execution
@@ -339,11 +395,16 @@ println(tasks.exists("new-poller"))
 Any registered task (including schedule-less ones) can be triggered manually:
 
 ```kotlin
-// Fire-and-forget — returns a Future<Any?>
+// Fire-and-forget — returns a Future<TaskRunResult>
 val future = tasks.run("flush-cache")
 
-// Block until complete — re-throws task exceptions
-tasks.runBlocking("flush-cache")
+// Block until complete — returns Success, Failure, Skipped, or Rejected
+when (val result = tasks.runBlocking("flush-cache")) {
+    is TaskRunResult.Success -> println("done: ${result.value}")
+    is TaskRunResult.Failure -> println("failed: ${result.error.message}")
+    is TaskRunResult.Skipped -> println("skipped: ${result.reason}")
+    is TaskRunResult.Rejected -> println("rejected: ${result.reason}")
+}
 
 // Pass extra context values for this execution only
 tasks.runBlocking("generate-report", mapOf("format" to "pdf"))
@@ -378,7 +439,9 @@ tasks.shutdown(awaitTermination = false)
 tasks.await()
 ```
 
-`start()` and `shutdown()` are both idempotent.
+`start()` is idempotent while the scheduler is running, and `shutdown()` is
+idempotent. A scheduler is single-use: after shutdown it cannot be restarted,
+new tasks cannot be registered, and control operations fail explicitly.
 Registering a task after `start()` enqueues it immediately.
 
 ---
@@ -404,6 +467,10 @@ Test dependencies: `org.junit.jupiter` (JUnit 5).
 ---
 
 ## Examples
+
+For a runnable web UI example, see [`examples/task-dashboard`](examples/task-dashboard).
+It uses the Colleen web framework to provide a mission-control style dashboard for
+running, enabling, disabling, removing, and resetting demo Cleary tasks.
 
 ```kotlin
 import io.github.cymoo.cleary.*

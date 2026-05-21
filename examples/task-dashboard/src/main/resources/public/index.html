@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cleary Dashboard</title>
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body data-page="dashboard">
+    <header class="shell topbar">
+        <a class="brand" href="/" aria-label="Cleary dashboard home">
+            <span class="brand__mark"></span>
+            <span>
+                <strong>Cleary</strong>
+                <small>Task operations</small>
+            </span>
+        </a>
+        <nav class="nav" aria-label="Dashboard navigation">
+            <a class="nav__link is-active" href="/">Dashboard</a>
+            <a class="nav__link" href="/history.html">History</a>
+        </nav>
+    </header>
+
+    <main class="shell layout">
+        <section class="hero">
+            <div>
+                <p class="eyebrow">Live scheduler</p>
+                <h1>Compact task control.</h1>
+                <p class="lede">The homepage shows only operational signals. Open a task for full description, counters, retry policy, and event history.</p>
+            </div>
+            <div class="hero__status">
+                <span id="health-dot" class="health-dot"></span>
+                <strong id="health">--</strong>
+                <small id="scheduler-state">checking scheduler</small>
+            </div>
+        </section>
+
+        <section class="metric-strip" aria-label="Scheduler summary">
+            <article class="metric">
+                <span>Tasks</span>
+                <strong id="task-count">--</strong>
+                <small id="task-enabled">-- enabled</small>
+            </article>
+            <article class="metric">
+                <span>Running</span>
+                <strong id="running-count">--</strong>
+                <small id="removed-count">-- removed</small>
+            </article>
+            <article class="metric">
+                <span>Success</span>
+                <strong id="success-rate">--</strong>
+                <small id="avg-duration">-- avg</small>
+            </article>
+            <article class="metric">
+                <span>Events</span>
+                <strong id="history-retained">--</strong>
+                <small id="history-capacity">-- capacity</small>
+            </article>
+        </section>
+
+        <section class="panel">
+            <div class="panel__heading">
+                <div>
+                    <p class="eyebrow">Registry</p>
+                    <h2>Tasks</h2>
+                </div>
+                <div class="toolbar">
+                    <span id="last-updated" class="subtle">not updated</span>
+                    <button id="reset-button" class="button button--danger" type="button">Reset</button>
+                </div>
+            </div>
+
+            <div class="table-shell">
+                <table class="task-table">
+                    <thead>
+                    <tr>
+                        <th>Task</th>
+                        <th>State</th>
+                        <th>Schedule</th>
+                        <th>Next</th>
+                        <th>Last</th>
+                        <th>Actions</th>
+                    </tr>
+                    </thead>
+                    <tbody id="task-rows"></tbody>
+                </table>
+                <div id="empty-tasks" class="empty" hidden>
+                    All tasks have been removed. Reset the dashboard to restore the demo registry.
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js" defer></script>
+</body>
+</html>

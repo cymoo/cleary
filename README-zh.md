@@ -17,7 +17,8 @@ Cleary 是一个使用 Kotlin 编写的轻量级的 JVM 任务调度器。
 - **重试机制（退避）** —— 支持固定或指数退避，并可配置最大延迟
 - **并发保护** —— 默认跳过重叠执行（可按任务启用并发）
 - **动态任务管理** —— 支持运行时注册、禁用、启用和删除任务
-- **可观测性钩子** —— 提供 `onTaskStart`、`onTaskComplete`、`onRetry` 回调
+- **显式执行结果** —— 区分成功、失败、跳过和拒绝
+- **可观测性钩子** —— 提供生命周期、重试、跳过、拒绝和调度器错误回调
 - **共享上下文** —— 无需闭包即可向任务注入服务或数据
 
 ---
@@ -80,6 +81,7 @@ tasks.await()
 | 属性                     | 默认值                            | 描述                                     |
 |------------------------|--------------------------------|----------------------------------------|
 | `concurrency`          | min(32, max(4, CPU cores × 4)) | 工作线程池大小                                |
+| `queueCapacity`        | `10_000`                       | worker 队列容量，满后会拒绝执行请求                 |
 | `threadNamePrefix`     | `"task-scheduler"`             | 所有线程名称前缀                               |
 | `autoStart`            | `false`                        | 构造后立即启动调度器                             |
 | `registerShutdownHook` | `false`                        | 注册 JVM shutdown hook 自动调用 `shutdown()` |
@@ -87,6 +89,9 @@ tasks.await()
 | `onTaskStart`          | `null`                         | 每次执行开始前触发                              |
 | `onTaskComplete`       | `null`                         | 每次执行结束后触发（成功或失败）                       |
 | `onRetry`              | `null`                         | 每次失败且仍有重试机会时触发                         |
+| `onTaskSkipped`        | `null`                         | 并发保护跳过一次执行时触发                         |
+| `onTaskRejected`       | `null`                         | worker 队列拒绝一次执行时触发                     |
+| `onSchedulerError`     | `null`                         | 钩子或调度循环抛异常时触发                         |
 
 ---
 
@@ -160,6 +165,8 @@ tasks.task("warmup-then-poll") {
 }
 ```
 
+如果 `initialDelay` 和 `once(at)` 组合使用，实际执行时间是 `at + delay`。
+
 ---
 
 ## 重试机制
@@ -192,7 +199,8 @@ tasks.task("sync") {
 
 默认情况下，同一任务不会并发执行。
 
-如果任务尚未完成，下一个执行周期将被跳过：
+如果任务尚未完成，下一个执行周期将被跳过；手动执行会返回
+`TaskRunResult.Skipped`，所有执行都会触发 `onTaskSkipped`：
 
 ```kotlin
 tasks.task("slow-report") {
@@ -269,8 +277,24 @@ val tasks = TaskScheduler {
     onRetry = { event ->
         logger.warn("RETRY ${event.taskName}")
     }
+
+    onTaskSkipped = { event ->
+        logger.info("SKIP ${event.taskName}: ${event.reason}")
+    }
+
+    onTaskRejected = { event ->
+        logger.warn("REJECT ${event.taskName}: ${event.reason}")
+    }
+
+    onSchedulerError = { event ->
+        logger.error("SCHEDULER ERROR ${event.phase}", event.error)
+    }
 }
 ```
+
+钩子异常会被隔离：`onTaskStart`、`onTaskComplete`、`onRetry`、
+`onTaskSkipped` 或 `onTaskRejected` 抛出的异常会报告给 `onSchedulerError`，
+不会改变任务本身的执行结果。
 
 ---
 
@@ -287,8 +311,13 @@ tasks.enable("new-poller")
 tasks.remove("new-poller")
 
 println(tasks.listTaskNames())
+println(tasks.getTaskInfo("new-poller"))
 println(tasks.exists("new-poller"))
 ```
+
+`TaskInfo` 同时包含静态元数据（`scheduleDescription`、`allowConcurrent`、
+`retryPolicy`）和运行时字段（`activeExecutions`、`running`、下一次/上一次时间、
+最近耗时/错误，以及成功、失败、跳过、拒绝计数）。
 
 ---
 
@@ -297,7 +326,12 @@ println(tasks.exists("new-poller"))
 ```kotlin
 val future = tasks.run("flush-cache")
 
-tasks.runBlocking("flush-cache")
+when (val result = tasks.runBlocking("flush-cache")) {
+    is TaskRunResult.Success -> println("done: ${result.value}")
+    is TaskRunResult.Failure -> println("failed: ${result.error.message}")
+    is TaskRunResult.Skipped -> println("skipped: ${result.reason}")
+    is TaskRunResult.Rejected -> println("rejected: ${result.reason}")
+}
 
 tasks.runBlocking("generate-report", mapOf("format" to "pdf"))
 ```
@@ -328,7 +362,8 @@ tasks.await()
 
 说明：
 
-* `start()` 和 `shutdown()` 是幂等的
+* `start()` 在运行中重复调用是幂等的，`shutdown()` 也是幂等的
+* 调度器是单次使用的：shutdown 后不能 restart，不能再注册新任务，控制操作会明确失败
 * start 后注册的任务会立即加入调度
 
 ---
@@ -356,6 +391,9 @@ JUnit 5
 ---
 
 ## 常见示例
+
+可运行的 Web UI 示例见 [`examples/task-dashboard`](examples/task-dashboard)。它使用
+Colleen Web 框架提供任务管理 dashboard，可运行、启用、停用、移除和重置演示任务。
 
 ```kotlin
 import io.github.cymoo.cleary.*

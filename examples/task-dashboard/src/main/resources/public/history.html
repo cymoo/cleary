@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cleary Execution History</title>
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body data-page="history">
+    <header class="shell topbar">
+        <a class="brand" href="/" aria-label="Cleary dashboard home">
+            <span class="brand__mark"></span>
+            <span>
+                <strong>Cleary</strong>
+                <small>Task operations</small>
+            </span>
+        </a>
+        <nav class="nav" aria-label="Dashboard navigation">
+            <a class="nav__link" href="/">Dashboard</a>
+            <a class="nav__link is-active" href="/history.html">History</a>
+        </nav>
+    </header>
+
+    <main class="shell layout">
+        <section class="hero hero--compact">
+            <div>
+                <p class="eyebrow">Bounded ledger</p>
+                <h1>Execution history.</h1>
+                <p class="lede">Recent scheduler, control, retry, skip, reject, and completion events retained in memory.</p>
+            </div>
+            <div class="toolbar toolbar--hero">
+                <label class="field">
+                    <span>Rows</span>
+                    <input id="history-limit" type="number" min="1" step="1" value="500">
+                </label>
+                <button id="refresh-history" class="button" type="button">Refresh</button>
+            </div>
+        </section>
+
+        <section class="panel">
+            <p id="history-meta" class="history-meta">Loading history...</p>
+            <div class="table-shell">
+                <table class="history-table">
+                    <thead>
+                    <tr>
+                        <th>Seq</th>
+                        <th>Time</th>
+                        <th>Task</th>
+                        <th>Status</th>
+                        <th>Type</th>
+                        <th>Message</th>
+                        <th>Detail</th>
+                    </tr>
+                    </thead>
+                    <tbody id="history-rows"></tbody>
+                </table>
+                <div id="empty-history" class="empty" hidden>No execution history has been recorded yet.</div>
+            </div>
+        </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js" defer></script>
+</body>
+</html>

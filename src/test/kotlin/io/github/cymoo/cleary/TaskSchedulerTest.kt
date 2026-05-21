@@ -57,6 +57,20 @@ class TaskSchedulerTest {
         }
     }
 
+    private fun assertSuccessValue(expected: Any?, result: TaskRunResult) {
+        assertTrue(result is TaskRunResult.Success) { "Expected Success but got $result" }
+        assertEquals(expected, (result as TaskRunResult.Success).value)
+    }
+
+    private fun assertSuccess(result: TaskRunResult) {
+        assertTrue(result is TaskRunResult.Success) { "Expected Success but got $result" }
+    }
+
+    private fun assertFailureMessage(expected: String, result: TaskRunResult) {
+        assertTrue(result is TaskRunResult.Failure) { "Expected Failure but got $result" }
+        assertEquals(expected, (result as TaskRunResult.Failure).error.message)
+    }
+
     // =========================================================================
     // 1. Lifecycle
     // =========================================================================
@@ -69,6 +83,7 @@ class TaskSchedulerTest {
         @DisplayName("isRunning is false before start()")
         fun notRunningBeforeStart() {
             tm = TaskScheduler()          // autoStart = false by default
+            assertEquals(SchedulerState.NEW, tm.state)
             assertFalse(tm.isRunning)
             assertFalse(tm.isTerminated)
         }
@@ -78,6 +93,7 @@ class TaskSchedulerTest {
         fun runningAfterStart() {
             tm = TaskScheduler()
             tm.start()
+            assertEquals(SchedulerState.RUNNING, tm.state)
             assertTrue(tm.isRunning)
         }
 
@@ -102,6 +118,7 @@ class TaskSchedulerTest {
         fun notRunningAfterShutdown() {
             tm = scheduler()
             tm.shutdown()
+            assertEquals(SchedulerState.SHUTDOWN, tm.state)
             assertFalse(tm.isRunning)
         }
 
@@ -118,6 +135,7 @@ class TaskSchedulerTest {
         fun shutdownBeforeStart() {
             tm = TaskScheduler()
             assertDoesNotThrow { tm.shutdown() }
+            assertEquals(SchedulerState.SHUTDOWN, tm.state)
         }
 
         @Test
@@ -126,6 +144,29 @@ class TaskSchedulerTest {
             tm = TaskScheduler()
             tm.task("t") { run { } }
             assertThrows<IllegalStateException> { tm.run("t") }
+        }
+
+        @Test
+        @DisplayName("shutdown scheduler is single-use and rejects mutating operations")
+        fun shutdownRejectsFurtherUse() {
+            tm = scheduler()
+            tm.task("t") { run { } }
+            tm.shutdown()
+
+            assertThrows<IllegalStateException> { tm.start() }
+            assertThrows<IllegalStateException> { tm.task("new") { run { } } }
+            assertThrows<IllegalStateException> { tm.run("t") }
+            assertThrows<IllegalStateException> { tm.enable("t") }
+            assertThrows<IllegalStateException> { tm.disable("t") }
+            assertThrows<IllegalStateException> { tm.remove("t") }
+        }
+
+        @Test
+        @DisplayName("config rejects invalid concurrency and queue capacity")
+        fun configRejectsInvalidValues() {
+            assertThrows<IllegalArgumentException> { TaskScheduler { concurrency = 0 } }
+            assertThrows<IllegalArgumentException> { TaskScheduler { queueCapacity = 0 } }
+            assertThrows<IllegalArgumentException> { TaskScheduler { threadNamePrefix = "  " } }
         }
     }
 
@@ -229,6 +270,15 @@ class TaskSchedulerTest {
             assertFalse(info.allowConcurrent)
             assertNotNull(info.retryPolicy)
             assertEquals(3, info.retryPolicy!!.maxAttempts)
+            assertFalse(info.running)
+            assertEquals(0, info.activeExecutions)
+            assertNotNull(info.nextScheduledAt)
+            assertNull(info.lastStartedAt)
+            assertEquals(0, info.runCount)
+            assertEquals(0, info.successCount)
+            assertEquals(0, info.failureCount)
+            assertEquals(0, info.skipCount)
+            assertEquals(0, info.rejectedCount)
         }
 
         @Test
@@ -258,20 +308,19 @@ class TaskSchedulerTest {
         }
 
         @Test
-        @DisplayName("runBlocking() returns the task's return value")
+        @DisplayName("runBlocking() returns Success with the task's return value")
         fun runBlockingReturnsValue() {
             tm = scheduler()
             tm.task("t") { run { 42 } }
-            assertEquals(42, tm.runBlocking("t"))
+            assertSuccessValue(42, tm.runBlocking("t"))
         }
 
         @Test
-        @DisplayName("runBlocking() re-throws task exception")
-        fun runBlockingRethrowsException() {
+        @DisplayName("runBlocking() returns Failure for task exception")
+        fun runBlockingReturnsFailure() {
             tm = scheduler()
             tm.task("t") { run { error("boom") } }
-            val ex = assertThrows<IllegalStateException> { tm.runBlocking("t") }
-            assertEquals("boom", ex.message)
+            assertFailureMessage("boom", tm.runBlocking("t"))
         }
 
         @Test
@@ -331,8 +380,8 @@ class TaskSchedulerTest {
             // Two independent executions should not share state
             val r1 = tm.runBlocking("t")
             val r2 = tm.runBlocking("t")
-            assertEquals("value", r1)
-            assertEquals("value", r2)
+            assertSuccessValue("value", r1)
+            assertSuccessValue("value", r2)
         }
     }
 
@@ -566,9 +615,39 @@ class TaskSchedulerTest {
         }
 
         @Test
-        @DisplayName("manual run() with allowConcurrent=false returns null when busy")
+        @DisplayName("TaskInfo reports running concurrent executions")
+        fun taskInfoReportsConcurrentRunningExecutions() {
+            tm = scheduler(concurrency = 2)
+            val started = CountDownLatch(2)
+            val blocker = CountDownLatch(1)
+            tm.task("parallel") {
+                concurrent(true)
+                run {
+                    started.countDown()
+                    blocker.await(2, TimeUnit.SECONDS)
+                }
+            }
+
+            val first = tm.run("parallel")
+            val second = tm.run("parallel")
+            awaitLatch(started)
+
+            val info = tm.getTaskInfo("parallel")!!
+            assertTrue(info.running)
+            assertEquals(2, info.activeExecutions)
+
+            blocker.countDown()
+            assertSuccess(first.get())
+            assertSuccess(second.get())
+        }
+
+        @Test
+        @DisplayName("manual run() with allowConcurrent=false returns Skipped when busy")
         fun manualRunSkipsWhenBusy() {
-            tm = scheduler(concurrency = 4)
+            val skippedEvents = CopyOnWriteArrayList<TaskSkippedEvent>()
+            tm = scheduler(concurrency = 4) {
+                onTaskSkipped = { skippedEvents.add(it) }
+            }
             val blocker = CountDownLatch(1)
             val started = CountDownLatch(1)
 
@@ -585,8 +664,45 @@ class TaskSchedulerTest {
 
             // Second call while first is still in progress — should be skipped
             val result = tm.runBlocking("busy")
-            assertNull(result) { "Expected null (skipped) but got $result" }
+            assertTrue(result is TaskRunResult.Skipped) { "Expected Skipped but got $result" }
+            assertEquals("busy", (result as TaskRunResult.Skipped).taskName)
+            assertEquals(TaskSkipReason.ALREADY_RUNNING, result.reason)
+            assertEquals(1, skippedEvents.size)
+            assertEquals(TaskExecutionType.MANUAL, skippedEvents[0].executionType)
 
+            blocker.countDown()
+        }
+
+        @Test
+        @DisplayName("worker queue full returns Rejected and fires onTaskRejected")
+        fun workerQueueFullRejectsManualRun() {
+            val rejectedEvents = CopyOnWriteArrayList<TaskRejectedEvent>()
+            tm = TaskScheduler {
+                autoStart = true
+                concurrency = 1
+                queueCapacity = 1
+                onTaskRejected = { rejectedEvents.add(it) }
+            }
+            val started = CountDownLatch(1)
+            val blocker = CountDownLatch(1)
+
+            tm.task("queued") {
+                concurrent(true)
+                run {
+                    started.countDown()
+                    blocker.await(2, TimeUnit.SECONDS)
+                }
+            }
+
+            tm.run("queued")
+            assertTrue(started.await(2, TimeUnit.SECONDS))
+            tm.run("queued")
+            val result = tm.runBlocking("queued")
+
+            assertTrue(result is TaskRunResult.Rejected) { "Expected Rejected but got $result" }
+            assertEquals(TaskRejectedReason.WORKER_QUEUE_FULL, (result as TaskRunResult.Rejected).reason)
+            assertEquals(1, rejectedEvents.size)
+            assertEquals(TaskExecutionType.MANUAL, rejectedEvents[0].executionType)
             blocker.countDown()
         }
     }
@@ -610,13 +726,13 @@ class TaskSchedulerTest {
                     if (attempts.incrementAndGet() < 2) error("fail")
                 }
             }
-            assertDoesNotThrow { tm.runBlocking("retry-ok") }
+            assertSuccess(tm.runBlocking("retry-ok"))
             assertEquals(2, attempts.get())
         }
 
         @Test
-        @DisplayName("exception is thrown after all attempts are exhausted")
-        fun throwsAfterAllAttempts() {
+        @DisplayName("Failure is returned after all attempts are exhausted")
+        fun failureAfterAllAttempts() {
             tm = scheduler()
             val attempts = AtomicInteger(0)
             tm.task("retry-fail") {
@@ -626,8 +742,7 @@ class TaskSchedulerTest {
                     error("always fails")
                 }
             }
-            val ex = assertThrows<IllegalStateException> { tm.runBlocking("retry-fail") }
-            assertEquals("always fails", ex.message)
+            assertFailureMessage("always fails", tm.runBlocking("retry-fail"))
             assertEquals(3, attempts.get())
         }
 
@@ -643,7 +758,7 @@ class TaskSchedulerTest {
                 retry(maxAttempts = 3, initialDelay = Duration.ofMillis(10))
                 run { error("boom") }
             }
-            assertThrows<IllegalStateException> { tm.runBlocking("t") }
+            assertFailureMessage("boom", tm.runBlocking("t"))
             // 3 attempts → 2 intermediate failures → 2 onRetry events
             assertEquals(2, retryEvents.size)
             assertEquals(1, retryEvents[0].failedAttempts)
@@ -662,7 +777,7 @@ class TaskSchedulerTest {
                 retry(maxAttempts = 2, initialDelay = Duration.ofMillis(10))
                 run { error("boom") }
             }
-            assertThrows<IllegalStateException> { tm.runBlocking("t") }
+            assertFailureMessage("boom", tm.runBlocking("t"))
             assertEquals(1, retryCount.get()) { "onRetry should fire once (between attempt 1 and 2)" }
         }
 
@@ -682,7 +797,7 @@ class TaskSchedulerTest {
                 )
                 run { error("boom") }
             }
-            assertThrows<IllegalStateException> { tm.runBlocking("t") }
+            assertFailureMessage("boom", tm.runBlocking("t"))
             assertEquals(3, delays.size)
             // 50, 100, 200
             assertTrue(delays[0] < delays[1]) { "delays[0]=${delays[0]} should be < delays[1]=${delays[1]}" }
@@ -701,7 +816,7 @@ class TaskSchedulerTest {
                 retry(maxAttempts = 3, initialDelay = Duration.ofMillis(30), backoffMultiplier = 1.0)
                 run { error("boom") }
             }
-            assertThrows<IllegalStateException> { tm.runBlocking("t") }
+            assertFailureMessage("boom", tm.runBlocking("t"))
             assertEquals(2, delays.size)
             assertEquals(delays[0], delays[1])
         }
@@ -723,7 +838,7 @@ class TaskSchedulerTest {
                 )
                 run { error("boom") }
             }
-            assertThrows<IllegalStateException> { tm.runBlocking("t") }
+            assertFailureMessage("boom", tm.runBlocking("t"))
             assertTrue(delays.all { it <= 200 }) { "All delays should be ≤ 200 ms: $delays" }
         }
     }
@@ -965,6 +1080,52 @@ class TaskSchedulerTest {
             tm.task("t") { run { Thread.sleep(20) } }
             tm.runBlocking("t")
             assertTrue(event.get().duration >= 0)
+        }
+
+        @Test
+        @DisplayName("callback exceptions are isolated and reported")
+        fun callbackExceptionsAreReported() {
+            val errors = CopyOnWriteArrayList<SchedulerErrorEvent>()
+            val completed = CountDownLatch(1)
+            tm = TaskScheduler {
+                autoStart = true
+                onTaskStart = { error("hook boom") }
+                onTaskComplete = { completed.countDown() }
+                onSchedulerError = { errors.add(it) }
+            }
+            tm.task("t") { run { "ok" } }
+
+            assertSuccessValue("ok", tm.runBlocking("t"))
+            awaitLatch(completed)
+            assertEquals(1, errors.size)
+            assertEquals("t", errors[0].taskName)
+            assertEquals(SchedulerErrorPhase.ON_TASK_START, errors[0].phase)
+            assertEquals("hook boom", errors[0].error.message)
+        }
+
+        @Test
+        @DisplayName("TaskInfo exposes runtime counters and last failure")
+        fun taskInfoExposesRuntimeCounters() {
+            tm = scheduler()
+            val calls = AtomicInteger(0)
+            tm.task("tracked") {
+                run {
+                    if (calls.incrementAndGet() == 1) "ok" else error("bad")
+                }
+            }
+
+            assertSuccessValue("ok", tm.runBlocking("tracked"))
+            assertFailureMessage("bad", tm.runBlocking("tracked"))
+
+            val info = tm.getTaskInfo("tracked")!!
+            assertEquals(2, info.runCount)
+            assertEquals(1, info.successCount)
+            assertEquals(1, info.failureCount)
+            assertNotNull(info.lastStartedAt)
+            assertNotNull(info.lastCompletedAt)
+            assertNotNull(info.lastDurationMs)
+            assertEquals("bad", info.lastError?.message)
+            assertFalse(info.running)
         }
     }
 

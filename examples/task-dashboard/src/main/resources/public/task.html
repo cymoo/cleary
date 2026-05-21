@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cleary Task Detail</title>
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body data-page="task">
+    <header class="shell topbar">
+        <a class="brand" href="/" aria-label="Cleary dashboard home">
+            <span class="brand__mark"></span>
+            <span>
+                <strong>Cleary</strong>
+                <small>Task operations</small>
+            </span>
+        </a>
+        <nav class="nav" aria-label="Dashboard navigation">
+            <a class="nav__link" href="/">Dashboard</a>
+            <a class="nav__link" href="/history.html">History</a>
+        </nav>
+    </header>
+
+    <main class="shell layout">
+        <section class="detail-hero">
+            <a class="back-link" href="/">← Back to dashboard</a>
+            <div class="detail-hero__grid">
+                <div>
+                    <p id="task-group" class="eyebrow">Task</p>
+                    <h1 id="task-title">Loading task</h1>
+                    <p id="task-description" class="lede">Fetching task metadata...</p>
+                </div>
+                <div class="detail-actions" id="detail-actions"></div>
+            </div>
+        </section>
+
+        <section class="metric-strip metric-strip--six" aria-label="Task metrics">
+            <article class="metric"><span>Runs</span><strong id="detail-runs">--</strong><small>total</small></article>
+            <article class="metric"><span>Success</span><strong id="detail-success">--</strong><small id="detail-success-rate">--</small></article>
+            <article class="metric"><span>Failures</span><strong id="detail-failures">--</strong><small>terminal</small></article>
+            <article class="metric"><span>Skipped</span><strong id="detail-skipped">--</strong><small>overlap guard</small></article>
+            <article class="metric"><span>Rejected</span><strong id="detail-rejected">--</strong><small>queue pressure</small></article>
+            <article class="metric"><span>Retries</span><strong id="detail-retries">--</strong><small>attempts</small></article>
+        </section>
+
+        <section class="detail-grid">
+            <article class="panel">
+                <div class="panel__heading panel__heading--compact">
+                    <div>
+                        <p class="eyebrow">Runtime</p>
+                        <h2>State</h2>
+                    </div>
+                    <span id="detail-status"></span>
+                </div>
+                <dl class="facts">
+                    <div><dt>Schedule</dt><dd id="detail-schedule">--</dd></div>
+                    <div><dt>Next run</dt><dd id="detail-next">--</dd></div>
+                    <div><dt>Last start</dt><dd id="detail-last-start">--</dd></div>
+                    <div><dt>Last complete</dt><dd id="detail-last-complete">--</dd></div>
+                    <div><dt>Average duration</dt><dd id="detail-average">--</dd></div>
+                    <div><dt>Last duration</dt><dd id="detail-last-duration">--</dd></div>
+                </dl>
+            </article>
+
+            <article class="panel">
+                <div class="panel__heading panel__heading--compact">
+                    <div>
+                        <p class="eyebrow">Policy</p>
+                        <h2>Execution</h2>
+                    </div>
+                </div>
+                <dl class="facts">
+                    <div><dt>Mode</dt><dd id="detail-mode">--</dd></div>
+                    <div><dt>Concurrency</dt><dd id="detail-concurrency">--</dd></div>
+                    <div><dt>Active executions</dt><dd id="detail-active">--</dd></div>
+                    <div><dt>Retry policy</dt><dd id="detail-retry">--</dd></div>
+                    <div><dt>Last result</dt><dd id="detail-result">--</dd></div>
+                    <div><dt>Last error</dt><dd id="detail-error">--</dd></div>
+                </dl>
+            </article>
+        </section>
+
+        <section class="panel">
+            <div class="panel__heading">
+                <div>
+                    <p class="eyebrow">Task ledger</p>
+                    <h2>Recent events</h2>
+                </div>
+                <button id="refresh-task" class="button" type="button">Refresh</button>
+            </div>
+            <div class="table-shell">
+                <table class="history-table">
+                    <thead>
+                    <tr>
+                        <th>Seq</th>
+                        <th>Time</th>
+                        <th>Status</th>
+                        <th>Type</th>
+                        <th>Message</th>
+                        <th>Detail</th>
+                    </tr>
+                    </thead>
+                    <tbody id="task-history-rows"></tbody>
+                </table>
+                <div id="empty-task-history" class="empty" hidden>No events for this task yet.</div>
+            </div>
+        </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js" defer></script>
+</body>
+</html>
