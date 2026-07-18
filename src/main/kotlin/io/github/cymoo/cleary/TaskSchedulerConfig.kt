@@ -70,6 +70,22 @@ class TaskSchedulerConfig {
 }
 
 /**
+ * Multicast observer of task lifecycle events, registered via
+ * [TaskScheduler.addListener]. Unlike the single-slot config hooks, any number
+ * of listeners can observe a scheduler without displacing each other; they fire
+ * after the task-level and global hooks. All methods default to no-ops.
+ * Implementations must be fast and non-blocking.
+ */
+interface TaskLifecycleListener {
+    fun onTaskStart(event: TaskStartEvent) {}
+    fun onTaskComplete(event: TaskCompleteEvent) {}
+    fun onRetry(event: TaskRetryEvent) {}
+    fun onTaskSkipped(event: TaskSkippedEvent) {}
+    fun onTaskRejected(event: TaskRejectedEvent) {}
+    fun onSchedulerError(event: SchedulerErrorEvent) {}
+}
+
+/**
  * Policy for fire times that are already in the past when dispatched (after system
  * sleep, clock jumps, or a saturated scheduler).
  */

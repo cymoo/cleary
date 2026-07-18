@@ -72,6 +72,17 @@ class TaskScheduler private constructor(
     /** Executions whose future has not been settled yet; swept on shutdown so no caller hangs. */
     private val livePendings = ConcurrentHashMap.newKeySet<PendingExecution>()
 
+    private val listeners = java.util.concurrent.CopyOnWriteArrayList<TaskLifecycleListener>()
+
+    @Volatile
+    private var startedAtMs: Long? = null
+
+    /** Epoch millis of the successful [start] call, or null before start. */
+    internal val startedAtMillis: Long? get() = startedAtMs
+
+    /** Worker pool size, exposed for monitoring frontends. */
+    internal val workerConcurrency: Int get() = config.concurrency
+
     /** Current lifecycle state of this single-use scheduler. */
     val state: SchedulerState get() = lifecycleState.get()
 
@@ -135,6 +146,7 @@ class TaskScheduler private constructor(
     fun start() {
         when {
             lifecycleState.compareAndSet(SchedulerState.NEW, SchedulerState.RUNNING) -> {
+                startedAtMs = System.currentTimeMillis()
                 schedulerThread.start()
                 tasks.values.forEach(::armInitial)
                 if (config.registerShutdownHook) {
@@ -231,13 +243,52 @@ class TaskScheduler private constructor(
         val entry = tasks[name] ?: throw NoSuchElementException("Task '$name' not found")
         entry.enabled.set(false)
         cancelStream(entry)
-        entry.stats.nextScheduledAt = null
     }
 
     /** Removes a task from the registry and cancels its pending scheduled fire. */
     fun remove(name: String) {
         check(state != SchedulerState.SHUTDOWN) { "TaskScheduler has been shut down" }
         tasks.remove(name)?.let(::cancelStream)
+    }
+
+    /**
+     * Replaces only the schedule of a registered task, keeping its body, settings,
+     * enabled state, and statistics. Passing null makes the task manual-only.
+     */
+    fun reschedule(name: String, schedule: Schedule?, initialDelay: Duration? = null) {
+        ensureAcceptsConfiguration()
+        while (true) {
+            val old = tasks[name] ?: throw NoSuchElementException("Task '$name' not found")
+            val entry = TaskEntry(
+                name = name,
+                schedule = schedule,
+                initialDelay = initialDelay,
+                trigger = schedule?.toTrigger(initialDelay),
+                allowConcurrent = old.allowConcurrent,
+                retryPolicy = old.retryPolicy,
+                timeout = old.timeout,
+                tags = old.tags,
+                hooks = old.hooks,
+                enabled = AtomicBoolean(old.enabled.get()),
+                stats = old.stats,
+                block = old.block
+            )
+            if (tasks.replace(name, old, entry)) {
+                cancelStream(old)
+                if (state == SchedulerState.RUNNING) armInitial(entry)
+                return
+            }
+        }
+    }
+
+    /** Registers a listener observing all task lifecycle events. */
+    fun addListener(listener: TaskLifecycleListener) {
+        listeners.addIfAbsent(listener)
+    }
+
+    /** Removes a previously registered listener. */
+    fun removeListener(listener: TaskLifecycleListener) {
+        listeners.remove(listener)
     }
 
     /** Returns whether a task is currently registered. */
@@ -255,6 +306,35 @@ class TaskScheduler private constructor(
 
     /** Returns a runtime snapshot for a task, or null when it is not registered. */
     fun getTaskInfo(name: String): TaskInfo? = tasks[name]?.toTaskInfo()
+
+    /** Returns a task's schedule and initial delay, for monitoring frontends. */
+    internal fun scheduleOf(name: String): Pair<Schedule?, Duration?>? =
+        tasks[name]?.let { it.schedule to it.initialDelay }
+
+    /**
+     * Projects fire times within `[now, now + windowMs]` for grid-based schedules
+     * (fixed-rate and cron, whose triggers are pure). Other schedule types report
+     * at most their already-armed next fire.
+     */
+    internal fun upcomingFireTimes(name: String, windowMs: Long, limit: Int): List<Long> {
+        val entry = tasks[name] ?: return emptyList()
+        if (!entry.enabled.get()) return emptyList()
+        val first = entry.stats.nextScheduledAt ?: return emptyList()
+        val horizon = saturatedAdd(System.currentTimeMillis(), windowMs)
+        if (first > horizon) return emptyList()
+        val times = mutableListOf(first)
+        if (entry.schedule is Schedule.FixedRate || entry.schedule is Schedule.Cron) {
+            val trigger = entry.trigger ?: return times
+            var last = first
+            while (times.size < limit) {
+                val next = trigger.nextExecutionTime(last, last) ?: break
+                if (next > horizon) break
+                times.add(next)
+                last = next
+            }
+        }
+        return times
+    }
 
     // ------------------------------------------------------------------------
     // Scheduling
@@ -286,6 +366,7 @@ class TaskScheduler private constructor(
 
     private fun cancelStream(entry: TaskEntry) {
         entry.currentFire.getAndSet(null)?.let { taskQueue.remove(it) }
+        entry.stats.nextScheduledAt = null
     }
 
     private fun runScheduler() {
@@ -420,7 +501,7 @@ class TaskScheduler private constructor(
                 actualTime = pending.startedAt,
                 context = pending.context
             )
-            fireHooks(entry.name, SchedulerErrorPhase.ON_TASK_START, startEvent, entry.hooks.onStart, config.onTaskStart)
+            fireHooks(entry.name, SchedulerErrorPhase.ON_TASK_START, startEvent, entry.hooks.onStart, config.onTaskStart) { l, e -> l.onTaskStart(e) }
         }
 
         val timeout = entry.timeout
@@ -483,7 +564,7 @@ class TaskScheduler private constructor(
             error = error,
             nextRetryDelayMs = delayMs
         )
-        fireHooks(entry.name, SchedulerErrorPhase.ON_RETRY, retryEvent, entry.hooks.onRetry, config.onRetry)
+        fireHooks(entry.name, SchedulerErrorPhase.ON_RETRY, retryEvent, entry.hooks.onRetry, config.onRetry) { l, e -> l.onRetry(e) }
 
         // Retries wait in the delay queue instead of sleeping on this worker thread.
         val item = QueueItem.Retry(pending, System.currentTimeMillis() + delayMs)
@@ -509,7 +590,7 @@ class TaskScheduler private constructor(
             entry.endExecution()
             val event = TaskCompleteEvent(entry.name, pending.startedAt, System.currentTimeMillis(), result, error)
             entry.stats.markCompleted(event)
-            fireHooks(entry.name, SchedulerErrorPhase.ON_TASK_COMPLETE, event, entry.hooks.onComplete, config.onTaskComplete)
+            fireHooks(entry.name, SchedulerErrorPhase.ON_TASK_COMPLETE, event, entry.hooks.onComplete, config.onTaskComplete) { l, e -> l.onTaskComplete(e) }
             if (error != null && entry.hooks.onComplete == null && config.onTaskComplete == null) {
                 logger.log(Level.WARNING, "Task '${entry.name}' failed", error)
             }
@@ -549,7 +630,7 @@ class TaskScheduler private constructor(
             reason = TaskSkipReason.ALREADY_RUNNING
         )
         entry.stats.skipCount.incrementAndGet()
-        fireHooks(entry.name, SchedulerErrorPhase.ON_TASK_SKIPPED, event, entry.hooks.onSkipped, config.onTaskSkipped)
+        fireHooks(entry.name, SchedulerErrorPhase.ON_TASK_SKIPPED, event, entry.hooks.onSkipped, config.onTaskSkipped) { l, e -> l.onTaskSkipped(e) }
     }
 
     private fun recordRejected(entry: TaskEntry, scheduledTime: Long?, type: TaskExecutionType) {
@@ -561,7 +642,7 @@ class TaskScheduler private constructor(
             reason = TaskRejectedReason.WORKER_QUEUE_FULL
         )
         entry.stats.rejectedCount.incrementAndGet()
-        fireHooks(entry.name, SchedulerErrorPhase.ON_TASK_REJECTED, event, entry.hooks.onRejected, config.onTaskRejected)
+        fireHooks(entry.name, SchedulerErrorPhase.ON_TASK_REJECTED, event, entry.hooks.onRejected, config.onTaskRejected) { l, e -> l.onTaskRejected(e) }
     }
 
     private fun ensureAcceptsConfiguration() {
@@ -576,29 +657,42 @@ class TaskScheduler private constructor(
         }
     }
 
-    /** Fires the task-level hook then the global hook, isolating failures of each. */
+    /** Fires the task hook, then the global hook, then listeners, isolating failures of each. */
     private fun <T> fireHooks(
         taskName: String,
         phase: SchedulerErrorPhase,
         event: T,
         taskHook: ((T) -> Unit)?,
-        globalHook: ((T) -> Unit)?
+        globalHook: ((T) -> Unit)?,
+        dispatch: (TaskLifecycleListener, T) -> Unit
     ) {
         safeHook(taskName, phase) { taskHook?.invoke(event) }
         safeHook(taskName, phase) { globalHook?.invoke(event) }
+        for (listener in listeners) {
+            safeHook(taskName, phase) { dispatch(listener, event) }
+        }
     }
 
     private fun reportSchedulerError(taskName: String?, phase: SchedulerErrorPhase, error: Throwable) {
+        val event = SchedulerErrorEvent(taskName, phase, error)
         val handler = config.onSchedulerError
         if (handler == null) {
             logger.log(Level.ERROR, "Scheduler error in phase $phase (task: $taskName)", error)
-            return
+        } else {
+            try {
+                handler(event)
+            } catch (secondary: Throwable) {
+                secondary.addSuppressed(error)
+                logger.log(Level.ERROR, "onSchedulerError hook threw", secondary)
+            }
         }
-        try {
-            handler(SchedulerErrorEvent(taskName, phase, error))
-        } catch (secondary: Throwable) {
-            secondary.addSuppressed(error)
-            logger.log(Level.ERROR, "onSchedulerError hook threw", secondary)
+        // Listener failures are logged directly: reporting them recursively could loop.
+        for (listener in listeners) {
+            try {
+                listener.onSchedulerError(event)
+            } catch (secondary: Throwable) {
+                logger.log(Level.ERROR, "TaskLifecycleListener.onSchedulerError threw", secondary)
+            }
         }
     }
 

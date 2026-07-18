@@ -21,9 +21,10 @@ control — all through a clean DSL with no annotation processing or reflection.
 - **Timeouts** — interrupt attempts that overrun, with cooperative cancellation via `isCancelled`
 - **Misfire policy** — skip missed fire times after system sleep, or catch them all up
 - **Concurrency guard** — overlapping executions are skipped (default) or allowed per task
-- **Dynamic task management** — register, disable, enable, replace, and remove tasks at runtime
+- **Dynamic task management** — register, disable, enable, replace, reschedule, and remove tasks at runtime
+- **Built-in web dashboard** — zero-dependency live UI for monitoring and controlling tasks
 - **Observable outcomes** — explicit success, failure, skipped, and rejected results
-- **Observability hooks** — global and per-task lifecycle callbacks, plus default logging when no hook is set
+- **Observability hooks** — global and per-task lifecycle callbacks, multicast listeners, plus default logging when no hook is set
 - **Tags** — group tasks and filter runtime snapshots with `listTasks(tag)`
 - **Shared context** — pass services and values into every task without closures
 
@@ -461,6 +462,22 @@ tasks.task("payment-sync") {
 }
 ```
 
+### Listeners
+
+The config hooks are single-slot properties. When several observers need the
+same events (metrics, logging, the built-in dashboard), register
+`TaskLifecycleListener`s instead — any number can coexist:
+
+```kotlin
+tasks.addListener(object : TaskLifecycleListener {
+    override fun onTaskComplete(event: TaskCompleteEvent) = metrics.record(event)
+    override fun onRetry(event: TaskRetryEvent) = logger.warn("retrying ${event.taskName}")
+})
+```
+
+Listeners fire after the task-level and global hooks; their failures are
+isolated just like hook failures.
+
 ### Default logging
 
 When no relevant hook is configured, Cleary logs through the JDK's
@@ -556,6 +573,10 @@ tasks.replace("new-poller") {
     run { pollV2() }
 }
 
+// Change only the schedule — body, settings, and stats are kept
+tasks.reschedule("new-poller", Schedule.FixedRate(1.minutes))
+tasks.reschedule("new-poller", null)   // make it manual-only
+
 // Inspect
 println(tasks.listTaskNames())
 println(tasks.listTasks())               // List<TaskInfo> for all tasks
@@ -576,6 +597,54 @@ tasks.remove("new-poller")
   `retryPolicy`, `timeout`, `tags`) and runtime fields (`activeExecutions`,
   `running`, next/last timestamps, last duration/error, and
   success/failure/skip/reject counters).
+
+---
+
+## Web Dashboard
+
+Cleary ships a built-in web dashboard served by the JDK's embedded HTTP server —
+no extra dependencies. It shows live scheduler state (overview counters, a
+per-task timeline of upcoming fires, and an activity feed of completions,
+failures, retries, timeouts, skips, and rejections) and supports manual runs,
+pause/resume, removal, and rescheduling from the browser with live expression
+preview. Light and dark themes included.
+
+```kotlin
+import io.github.cymoo.cleary.dashboard.Dashboard
+
+val dashboard = Dashboard(scheduler).start(port = 8378)
+println("Dashboard at http://localhost:${dashboard.port}")
+// ... later
+dashboard.stop()
+```
+
+Options:
+
+```kotlin
+Dashboard(scheduler) {
+    eventHistoryLimit = 300   // activity feed depth
+    readOnly = true           // all mutating endpoints answer 403
+}.start(port = 0)             // port 0 binds an ephemeral port; read dashboard.port
+```
+
+The schedule editor accepts `every <duration>` (`every 90s`, `every 1h30m`),
+`fixed-delay <duration>`, `once <ISO-8601 instant>`, or a Quartz cron
+expression. Edits are applied via `reschedule`, so statistics are preserved.
+
+The server binds to `127.0.0.1` by default and has **no authentication** — to
+expose it beyond localhost, front it with an authenticating reverse proxy or
+enable `readOnly`.
+
+The page is driven by a small JSON API that can also be used directly:
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/state?window=SECONDS` | Snapshot: stats, tasks with upcoming fire times, recent events |
+| `GET /api/schedule/preview?expr=…` | Validate an expression and project its next fires |
+| `POST /api/tasks/{name}/run` · `/pause` · `/resume` · `/remove` | Control actions |
+| `POST /api/tasks/{name}/schedule` | Reschedule; body `{"expr": "every 30s"}` |
+
+For a runnable demo, see [`examples/task-dashboard`](examples/task-dashboard).
 
 ---
 
@@ -698,10 +767,10 @@ Test dependencies: `org.junit.jupiter` (JUnit 5).
 
 ## Examples
 
-For a runnable web UI example, see [`examples/task-dashboard`](examples/task-dashboard).
-It uses the Colleen web framework to provide a mission-control style dashboard with
-group tabs, task details, bounded history, and controls for running, enabling,
-disabling, removing, and resetting demo Cleary tasks.
+For a runnable demo of the built-in web dashboard, see
+[`examples/task-dashboard`](examples/task-dashboard): a handful of tasks
+exercising fixed-rate, fixed-delay, cron, one-shot, retry, timeout, and
+manual-only scheduling, monitored at `http://localhost:8000`.
 
 ```kotlin
 import io.github.cymoo.cleary.*

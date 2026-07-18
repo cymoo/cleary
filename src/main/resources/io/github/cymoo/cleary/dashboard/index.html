@@ -1,0 +1,916 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cleary — tasks</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='5' fill='%236457e0'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="assets/styles.css">
+<script>
+(function () {
+  var t = localStorage.getItem("cleary-theme");
+  if (!t) t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  document.documentElement.dataset.theme = t;
+})();
+</script>
+</head>
+<body>
+<div class="page">
+  <div class="top">
+    <div class="brand"><span class="wordmark">cleary</span><span class="dot"></span></div>
+    <div class="top-spacer"></div>
+    <span class="pill" id="pill"><span class="pd"></span><span id="pill-text">Connecting…</span></span>
+    <span class="top-clock num" id="clock"></span>
+    <button class="iconbtn" id="theme-btn" type="button" title="Toggle theme" aria-label="Toggle theme"></button>
+  </div>
+
+  <div class="overview" id="overview"></div>
+
+  <section class="card">
+    <div class="card-head">
+      <span class="card-title">Tasks</span>
+      <span class="card-sub" id="tasks-sub"></span>
+      <span class="spacer"></span>
+      <span class="seg2" id="window-seg"><span class="lb">Horizon</span></span>
+    </div>
+    <div id="rows"></div>
+  </section>
+
+  <div class="section-gap"></div>
+
+  <div class="activity-head">
+    <h2>Activity</h2>
+    <span class="live"><span class="ld"></span>live</span>
+  </div>
+  <section class="card">
+    <div id="activity"></div>
+  </section>
+</div>
+
+<div class="toasts2" id="toasts"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  var API = "api";
+  var WINDOWS = [{ label: "5m", sec: 300 }, { label: "15m", sec: 900 }, { label: "1h", sec: 3600 }];
+  var EV_GLYPH = { completed: "✓", failed: "✕", skipped: "→", retry: "↻", rejected: "⊘", lifecycle: "•" };
+  var SCHED_PRESETS = [
+    { label: "every 30s", value: "every 30s" },
+    { label: "every 90s", value: "every 90s" },
+    { label: "fixed-delay 1m", value: "fixed-delay 1m" },
+    { label: "every 5 min", value: "0 */5 * * * ?" },
+    { label: "hourly", value: "0 0 * * * ?" },
+    { label: "daily 02:00", value: "0 0 2 * * ?" },
+  ];
+
+  /* ---------------- state ---------------- */
+  var data = null;        // last /api/state payload (times are epoch ms)
+  var clockSkew = 0;      // serverNow - clientNow
+  var windowSec = 300;
+  var selName = null;
+  var online = false;
+
+  function now() { return Date.now() + clockSkew; }
+
+  /* ---------------- dom helpers ---------------- */
+  function h(tag, cls, text) {
+    var el = document.createElement(tag);
+    if (cls) el.className = cls;
+    if (text != null) el.textContent = text;
+    return el;
+  }
+  var $ = function (id) { return document.getElementById(id); };
+
+  /* ---------------- formatting ---------------- */
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+  function fmtClock(ms) {
+    var d = new Date(ms);
+    return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+  }
+  function fmtTime(ms) { return fmtClock(ms); }
+  function fmtInShort(delta) {
+    var s = Math.max(0, Math.ceil(delta / 1000));
+    if (s >= 86400) return Math.floor(s / 86400) + "d " + Math.floor((s % 86400) / 3600) + "h";
+    if (s >= 3600) return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+    if (s >= 60) return Math.floor(s / 60) + "m " + pad2(s % 60) + "s";
+    return s + "s";
+  }
+  function fmtRel(ms, n) {
+    if (!ms) return "never";
+    var s = Math.max(0, Math.floor((n - ms) / 1000));
+    if (s < 5) return "just now";
+    if (s < 60) return s + "s ago";
+    if (s < 3600) return Math.floor(s / 60) + "m ago";
+    if (s < 86400) return Math.floor(s / 3600) + "h ago";
+    return Math.floor(s / 86400) + "d ago";
+  }
+  function fmtDur(ms) {
+    if (ms < 1000) return Math.round(ms) + "ms";
+    if (ms < 60000) return (ms / 1000).toFixed(1) + "s";
+    return Math.floor(ms / 60000) + "m" + pad2(Math.round((ms % 60000) / 1000)) + "s";
+  }
+  function fmtUptime(ms) {
+    var s = Math.floor(ms / 1000);
+    if (s < 90) return s + "s";
+    if (s < 5400) return Math.floor(s / 60) + "m";
+    if (s < 129600) return Math.floor(s / 3600) + "h";
+    return Math.floor(s / 86400) + "d";
+  }
+  var tzLabel = (function () {
+    var off = -new Date().getTimezoneOffset() / 60;
+    return "UTC" + (off >= 0 ? "+" : "") + off;
+  })();
+
+  /* ---------------- theme ---------------- */
+  var SUN = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4.4"/><path d="M12 2.5v2.4M12 19.1v2.4M2.5 12h2.4M19.1 12h2.4M5 5l1.7 1.7M17.3 17.3 19 19M19 5l-1.7 1.7M6.7 17.3 5 19"/></svg>';
+  var MOON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11Z"/></svg>';
+  function renderThemeBtn() {
+    $("theme-btn").innerHTML = document.documentElement.dataset.theme === "dark" ? SUN : MOON;
+  }
+  $("theme-btn").addEventListener("click", function () {
+    var next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem("cleary-theme", next);
+    renderThemeBtn();
+  });
+  renderThemeBtn();
+
+  /* ---------------- api ---------------- */
+  function api(path, opts) {
+    return fetch(API + path, opts).then(function (res) {
+      return res.json().catch(function () {
+        return { ok: false, error: "HTTP " + res.status };
+      });
+    });
+  }
+  function act(name, action, body) {
+    var opts = { method: "POST" };
+    if (body) {
+      opts.headers = { "Content-Type": "application/json" };
+      opts.body = JSON.stringify(body);
+    }
+    return api("/tasks/" + encodeURIComponent(name) + "/" + action, opts).then(function (j) {
+      if (!j.ok) { toast(j.error || "Action failed", true); return false; }
+      return true;
+    }).catch(function () { toast("Network error", true); return false; });
+  }
+
+  /* ---------------- toasts ---------------- */
+  function toast(msg, isErr) {
+    var el = h("div", "toast2" + (isErr ? " err" : ""));
+    el.appendChild(h("span", "tdot"));
+    el.appendChild(document.createTextNode(msg));
+    $("toasts").appendChild(el);
+    setTimeout(function () { el.remove(); }, 3200);
+  }
+
+  /* ---------------- top bar ---------------- */
+  function renderPill() {
+    var pill = $("pill"), text = $("pill-text");
+    if (!online) {
+      pill.className = "pill stopped";
+      text.textContent = "Unreachable";
+      return;
+    }
+    if (data && data.stats.started_at) {
+      pill.className = "pill";
+      text.textContent = "Scheduler running · " + fmtUptime(now() - data.stats.started_at);
+    } else {
+      pill.className = "pill stopped";
+      text.textContent = "Scheduler not started";
+    }
+  }
+  function renderClock() {
+    $("clock").textContent = fmtClock(now()) + " · " + tzLabel;
+  }
+
+  /* ---------------- overview ---------------- */
+  var ovRefs = null;
+  function buildOverview() {
+    var root = $("overview");
+    function block(label) {
+      var ov = h("div", "ov");
+      var big = h("span", "big num");
+      ov.appendChild(big);
+      ov.appendChild(h("span", "lbl", label));
+      root.appendChild(ov);
+      return { ov: ov, big: big };
+    }
+    ovRefs = {
+      tasks: block("Tasks"),
+      running: block("Running now"),
+      runs: block("Executions"),
+      errors: block("Errors"),
+      rate: block("Success rate"),
+    };
+  }
+  function renderOverview() {
+    var s = data.stats;
+    ovRefs.tasks.big.textContent = "";
+    ovRefs.tasks.big.appendChild(document.createTextNode(String(s.total_tasks)));
+    ovRefs.tasks.big.appendChild(h("span", "frac", " / " + s.enabled_tasks + " active"));
+    ovRefs.running.big.textContent = String(s.running_tasks);
+    ovRefs.running.ov.className = "ov" + (s.running_tasks > 0 ? " is-accent" : "");
+    ovRefs.runs.big.textContent = s.total_runs.toLocaleString();
+    ovRefs.errors.big.textContent = s.total_errors.toLocaleString();
+    ovRefs.errors.ov.className = "ov" + (s.total_errors > 0 ? " is-red" : "");
+    var rate = s.total_runs > 0 ? ((s.total_runs - s.total_errors) / s.total_runs) * 100 : 100;
+    ovRefs.rate.big.textContent = "";
+    ovRefs.rate.big.appendChild(document.createTextNode(rate.toFixed(1)));
+    ovRefs.rate.big.appendChild(h("span", "frac", "%"));
+  }
+
+  /* ---------------- window segmented control ---------------- */
+  (function () {
+    var seg = $("window-seg");
+    WINDOWS.forEach(function (w) {
+      var b = h("button", w.sec === windowSec ? "on" : "", w.label);
+      b.addEventListener("click", function () {
+        windowSec = w.sec;
+        Array.prototype.forEach.call(seg.querySelectorAll("button"), function (x) { x.className = ""; });
+        b.className = "on";
+        poll();
+      });
+      seg.appendChild(b);
+    });
+  })();
+
+  function renderTasksSub() {
+    var s = data.stats;
+    $("tasks-sub").textContent = data.tasks.length + " registered · " + s.workers + " workers";
+  }
+
+  /* ---------------- task rows ---------------- */
+  var rowMap = new Map();
+  var rowOrder = "";
+  var rulerEl = null;
+  var emptyEl = null;
+
+  function buildRuler() {
+    var head = h("div", "trow thead");
+    head.appendChild(h("span"));
+    head.appendChild(h("span", "colcap", "Task"));
+    rulerEl = h("div", "ruler2");
+    head.appendChild(rulerEl);
+    var nr = h("span", "colcap", "Next run");
+    nr.style.textAlign = "right";
+    head.appendChild(nr);
+    head.appendChild(h("span"));
+    $("rows").appendChild(head);
+    renderRuler();
+  }
+  function renderRuler() {
+    if (!rulerEl) return;
+    rulerEl.textContent = "";
+    rulerEl.appendChild(h("span", "r0", "NOW"));
+    for (var i = 1; i <= 4; i++) {
+      var frac = i / 5, sec = windowSec * frac;
+      var label = "+" + (sec >= 3600 ? (sec / 3600) + "h" : sec >= 60 ? (sec / 60) + "m" : sec + "s");
+      var m = h("span", "rm num", label);
+      m.style.left = (frac * 100) + "%";
+      rulerEl.appendChild(m);
+    }
+  }
+
+  function buildRow(name) {
+    var root = h("div", "trow");
+    var dot = h("span", "sdot ok");
+    root.appendChild(dot);
+
+    var tname = h("div", "tname");
+    var nm = h("div", "nm", name);
+    var meta = h("div", "meta num");
+    tname.appendChild(nm); tname.appendChild(meta);
+    root.appendChild(tname);
+
+    var lane = h("div", "lane2");
+    var rail = h("div", "rail");
+    var glow = h("div", "runglow");
+    glow.style.display = "none";
+    var note = h("span", "lnote num");
+    lane.appendChild(rail); lane.appendChild(glow); lane.appendChild(note);
+    root.appendChild(lane);
+
+    var tnext = h("div", "tnext");
+    var cd = h("div", "cd num");
+    var sub = h("div", "sub num");
+    tnext.appendChild(cd); tnext.appendChild(sub);
+    root.appendChild(tnext);
+
+    var acts = h("div", "tacts");
+    var btnRun = h("button", "rbtn", "Run");
+    var btnPause = h("button", "rbtn", "Pause");
+    acts.appendChild(btnRun); acts.appendChild(btnPause);
+    root.appendChild(acts);
+
+    root.tabIndex = 0;
+    root.setAttribute("role", "button");
+    root.setAttribute("aria-label", name + " — task details");
+    root.addEventListener("click", function () { selName === name ? closeDrawer() : openDrawer(name); });
+    root.addEventListener("keydown", function (e) {
+      if (e.target === root && (e.key === "Enter" || e.key === " ")) {
+        e.preventDefault();
+        selName === name ? closeDrawer() : openDrawer(name);
+      }
+    });
+    acts.addEventListener("click", function (e) { e.stopPropagation(); });
+    btnRun.addEventListener("click", function () { doRun(name); });
+    btnPause.addEventListener("click", function () { doTogglePause(name); });
+
+    return { root: root, dot: dot, meta: meta, lane: lane, glow: glow, note: note,
+             cd: cd, sub: sub, btnPause: btnPause, ticks: new Map(), task: null };
+  }
+
+  function updateRow(r) {
+    var t = r.task, n = now();
+    var st = t.running ? "run" : !t.enabled ? "off" : (t.last_error ? "err" : "ok");
+    r.dot.className = "sdot " + st;
+    r.root.className = "trow" + (selName === t.name ? " sel" : "") + (!t.enabled ? " paused" : "");
+
+    // meta line
+    r.meta.textContent = "";
+    r.meta.appendChild(document.createTextNode(t.meaning + " · " + t.run_count.toLocaleString() + " runs"));
+    if (t.error_count > 0) {
+      r.meta.appendChild(document.createTextNode(" · "));
+      r.meta.appendChild(h("span", "er", t.error_count.toLocaleString() + " errors"));
+    }
+    if (t.skip_count > 0) {
+      r.meta.appendChild(document.createTextNode(" · "));
+      r.meta.appendChild(h("span", "sk", t.skip_count.toLocaleString() + " skips"));
+    }
+
+    // countdown block
+    if (t.running) {
+      r.cd.className = "cd num running";
+      r.cd.textContent = "Running · " + (t.lastMs ? fmtDur(Math.max(0, n - t.lastMs)) : "");
+      r.sub.textContent = t.running_count > 1 ? t.running_count + " instances" : "in flight";
+    } else if (!t.enabled) {
+      r.cd.className = "cd num off";
+      r.cd.textContent = "Paused";
+      r.sub.textContent = "manual run allowed";
+    } else if (t.nextMs) {
+      var delta = t.nextMs - n;
+      r.cd.className = "cd num" + (delta < 15000 ? " soon" : "");
+      r.cd.textContent = "in " + fmtInShort(delta);
+      r.sub.textContent = "ran " + fmtRel(t.lastMs, n);
+    } else {
+      r.cd.className = "cd num off";
+      r.cd.textContent = "—";
+      r.sub.textContent = t.expr || t.schedule ? "not scheduled" : "manual only";
+    }
+    r.btnPause.textContent = t.enabled ? "Pause" : "Resume";
+
+    updateLane(r, n);
+  }
+
+  function updateLane(r, n) {
+    var t = r.task;
+    var windowMs = windowSec * 1000;
+    r.lane.classList.toggle("paused-lane", !t.enabled);
+    r.glow.style.display = t.running ? "" : "none";
+
+    var visible = new Set();
+    if (t.enabled) {
+      for (var i = 0; i < t.upcomingMs.length; i++) {
+        var ts = t.upcomingMs[i];
+        var pct = ((ts - n) / windowMs) * 100;
+        if (pct < -1 || pct > 100) continue;
+        visible.add(ts);
+        var tk = r.ticks.get(ts);
+        if (!tk) {
+          tk = h("span", "tk");
+          tk.style.left = pct + "%";
+          r.ticks.set(ts, tk);
+          r.lane.appendChild(tk);
+        } else {
+          tk.style.left = pct + "%";
+        }
+        tk.classList.toggle("far", pct > 62);
+      }
+    }
+    r.ticks.forEach(function (tk, ts) {
+      if (!visible.has(ts)) { tk.remove(); r.ticks.delete(ts); }
+    });
+
+    if (!t.enabled) {
+      r.note.textContent = "Paused";
+    } else if (visible.size === 0 && t.nextMs) {
+      r.note.textContent = "next " + fmtInShort(t.nextMs - n);
+    } else {
+      r.note.textContent = "";
+    }
+  }
+
+  function renderRows() {
+    var rows = $("rows");
+    if (!rulerEl) buildRuler();
+
+    if (!data.tasks.length) {
+      if (!emptyEl) {
+        emptyEl = h("div", "rows-empty", "No tasks registered. Add tasks with scheduler.task(\"name\") { … } in your code.");
+        rows.appendChild(emptyEl);
+      }
+    } else if (emptyEl) {
+      emptyEl.remove();
+      emptyEl = null;
+    }
+
+    var seen = new Set();
+    data.tasks.forEach(function (t) {
+      seen.add(t.name);
+      var r = rowMap.get(t.name);
+      if (!r) {
+        r = buildRow(t.name);
+        rowMap.set(t.name, r);
+        rows.appendChild(r.root);
+      }
+      r.task = t;
+      updateRow(r);
+    });
+    rowMap.forEach(function (r, name) {
+      if (!seen.has(name)) { r.root.remove(); rowMap.delete(name); }
+    });
+
+    var order = data.tasks.map(function (t) { return t.name; }).join("\n");
+    if (order !== rowOrder) {
+      data.tasks.forEach(function (t) { rows.appendChild(rowMap.get(t.name).root); });
+      rowOrder = order;
+    }
+  }
+
+  /* ---------------- activity ---------------- */
+  var actSig = "";
+  function renderActivity() {
+    var events = data.events || [];
+    var sig = events.length + ":" + (events.length ? events[0].at + events[0].kind + events[0].task : "");
+    if (sig === actSig) return;
+    actSig = sig;
+
+    var root = $("activity");
+    root.textContent = "";
+    if (!events.length) {
+      root.appendChild(h("div", "act-empty", "No activity yet."));
+      return;
+    }
+    events.slice(0, 30).forEach(function (ev) {
+      var row = h("div", "act k-" + ev.kind);
+      row.appendChild(h("span", "t num", fmtTime(ev.atMs)));
+      row.appendChild(h("span", "badge", EV_GLYPH[ev.kind] || "•"));
+      row.appendChild(h("span", "nm" + (ev.task ? "" : " sys"), ev.task || "scheduler"));
+      row.appendChild(h("span", "msg", ev.message));
+      row.appendChild(h("span", "dur num", ev.duration_ms > 0 ? fmtDur(ev.duration_ms) : ""));
+      root.appendChild(row);
+    });
+  }
+
+  /* ---------------- actions ---------------- */
+  function doRun(name) {
+    act(name, "run").then(function (ok) {
+      if (ok) { toast(name + " triggered"); poll(); }
+    });
+  }
+  function doTogglePause(name) {
+    var t = findTask(name);
+    if (!t) return;
+    act(name, t.enabled ? "pause" : "resume").then(function (ok) {
+      if (ok) { toast(name + (t.enabled ? " paused" : " resumed")); poll(); }
+    });
+  }
+  function findTask(name) {
+    if (!data) return null;
+    for (var i = 0; i < data.tasks.length; i++) if (data.tasks[i].name === name) return data.tasks[i];
+    return null;
+  }
+
+  /* ---------------- drawer ---------------- */
+  var dw = null;        // drawer refs
+  var editing = false;
+  var fires = [];       // next fire times (ms) for the selected task's current schedule
+  var firesExpr = "";
+
+  function openDrawer(name) {
+    closeDrawer();
+    selName = name;
+    var t = findTask(name);
+    if (!t) return;
+    buildDrawer();
+    if (t.expr) fetchFires(t.expr);
+    renderRows();
+  }
+  function closeDrawer() {
+    if (dw) { dw.scrim.remove(); dw.root.remove(); dw = null; }
+    selName = null;
+    editing = false;
+    fires = []; firesExpr = "";
+    if (data) renderRows();
+  }
+  function fetchFires(expr) {
+    firesExpr = expr;
+    api("/schedule/preview?expr=" + encodeURIComponent(expr)).then(function (j) {
+      if (j.ok && firesExpr === expr) {
+        fires = j.next || [];
+        if (dw && !editing) renderDrawer();
+      }
+    }).catch(function () {});
+  }
+
+  function spec(parent, key) {
+    var row = h("div", "spec2");
+    row.appendChild(h("span", "k", key));
+    var v = h("span", "v");
+    row.appendChild(v);
+    parent.appendChild(row);
+    return v;
+  }
+  function section(parent, title) {
+    var sec = h("div", "dsec2");
+    var head = h("div", "dsec2-title");
+    head.appendChild(h("span", null, title));
+    sec.appendChild(head);
+    parent.appendChild(sec);
+    return { sec: sec, head: head };
+  }
+
+  function buildDrawer() {
+    var scrim = h("div", "scrim2");
+    scrim.addEventListener("click", closeDrawer);
+    var root = h("aside", "drawer2");
+
+    // head
+    var head = h("div", "dw2-head");
+    var top = h("div", "dw2-top");
+    var dot = h("span", "sdot ok");
+    var nameEl = h("span", "dw2-name", selName);
+    var close = h("button", "dw2-close", "✕");
+    close.addEventListener("click", closeDrawer);
+    top.appendChild(dot); top.appendChild(nameEl); top.appendChild(close);
+    head.appendChild(top);
+    var stateLine = h("div", "dw2-state");
+    head.appendChild(stateLine);
+    var acts = h("div", "dw2-acts");
+    var btnRun = h("button", "btn2 primary grow", "Run now");
+    var btnPause = h("button", "btn2 grow", "Pause");
+    btnRun.addEventListener("click", function () { doRun(selName); });
+    btnPause.addEventListener("click", function () { doTogglePause(selName); });
+    acts.appendChild(btnRun); acts.appendChild(btnPause);
+    head.appendChild(acts);
+    root.appendChild(head);
+
+    var body = h("div", "dw2-body");
+    root.appendChild(body);
+
+    // schedule
+    var sched = section(body, "Schedule");
+    var editBtn = h("button", "linkbtn", "Edit");
+    sched.head.appendChild(editBtn);
+    var schedView = h("div");
+    sched.sec.appendChild(schedView);
+    var schedEdit = h("div");
+    schedEdit.style.display = "none";
+    sched.sec.appendChild(schedEdit);
+    editBtn.addEventListener("click", function () { startEdit(); });
+
+    // policy
+    var pol = section(body, "Execution policy");
+    var vTimeout = spec(pol.sec, "Timeout");
+    var vOverlap = spec(pol.sec, "Overlap");
+    var vRetry = spec(pol.sec, "Retry");
+    var vTags = spec(pol.sec, "Tags");
+    var vManual = spec(pol.sec, "Manual trigger");
+    vManual.className = "v soft";
+    vManual.textContent = "Allowed while paused";
+
+    // stats
+    var st = section(body, "Statistics");
+    var vExec = spec(st.sec, "Executions");
+    var vErr = spec(st.sec, "Errors");
+    var vSkip = spec(st.sec, "Skips");
+    var vRej = spec(st.sec, "Rejected");
+    var vRate = spec(st.sec, "Success rate");
+    var vLast = spec(st.sec, "Last run");
+    var errBox = h("div", "errbox2");
+    errBox.style.display = "none";
+    st.sec.appendChild(errBox);
+
+    // events
+    var evs = section(body, "Recent events");
+    var evList = h("div");
+    evs.sec.appendChild(evList);
+
+    // danger
+    var danger = section(body, "Danger zone");
+    var dangerBody = h("div");
+    danger.sec.appendChild(dangerBody);
+
+    document.body.appendChild(scrim);
+    document.body.appendChild(root);
+
+    dw = { scrim: scrim, root: root, dot: dot, stateLine: stateLine, btnPause: btnPause,
+           schedView: schedView, schedEdit: schedEdit, editBtn: editBtn,
+           vTimeout: vTimeout, vOverlap: vOverlap, vRetry: vRetry, vTags: vTags,
+           vExec: vExec, vErr: vErr, vSkip: vSkip, vRej: vRej, vRate: vRate, vLast: vLast,
+           errBox: errBox, evList: evList, dangerBody: dangerBody, evSig: "", confirming: false };
+    renderDrawer();
+    renderDanger();
+  }
+
+  function renderDrawer() {
+    if (!dw) return;
+    var t = findTask(selName);
+    if (!t) { closeDrawer(); return; }
+    var n = now();
+
+    var st = t.running ? "run" : !t.enabled ? "off" : (t.last_error ? "err" : "ok");
+    dw.dot.className = "sdot " + st;
+
+    dw.stateLine.textContent = "";
+    var b = h("b");
+    if (t.running) {
+      b.textContent = "Running";
+      dw.stateLine.appendChild(b);
+      dw.stateLine.appendChild(document.createTextNode(" · " + (t.lastMs ? fmtDur(Math.max(0, n - t.lastMs)) + " elapsed" : "in flight")));
+    } else if (t.enabled) {
+      b.textContent = "Idle";
+      dw.stateLine.appendChild(b);
+      dw.stateLine.appendChild(document.createTextNode(t.nextMs ? " · next run in " + fmtInShort(t.nextMs - n) : ""));
+    } else {
+      b.textContent = "Paused";
+      dw.stateLine.appendChild(b);
+      dw.stateLine.appendChild(document.createTextNode(" · manual runs still allowed"));
+    }
+    dw.btnPause.textContent = t.enabled ? "Pause" : "Resume";
+
+    // schedule view (skipped while editing)
+    if (!editing) {
+      dw.editBtn.style.display = t.expr ? "" : "none";
+      dw.schedView.textContent = "";
+      var vExpr = spec(dw.schedView, "Expression");
+      vExpr.className = "v mono";
+      vExpr.textContent = t.expr || t.schedule || "manual only";
+      var vMean = spec(dw.schedView, "Meaning");
+      vMean.textContent = t.meaning;
+      if (fires.length) {
+        var fl = h("div", "fires2");
+        fires.forEach(function (f) {
+          if (f < n) return;
+          var row = h("div", "fire2");
+          row.appendChild(h("b", null, fmtTime(f)));
+          row.appendChild(document.createTextNode(" — in " + fmtInShort(f - n)));
+          fl.appendChild(row);
+        });
+        dw.schedView.appendChild(fl);
+        if (fires[0] && fires[0] < n - 1500 && t.expr) fetchFires(t.expr);
+      }
+    }
+
+    // policy
+    dw.vTimeout.className = "v" + (t.timeout_ms > 0 ? "" : " soft");
+    dw.vTimeout.textContent = t.timeout_ms > 0 ? fmtDur(t.timeout_ms) : "none";
+    dw.vOverlap.className = "v soft";
+    dw.vOverlap.textContent = t.allow_overlapping ? "Allow parallel runs" : "Deny — skip if running";
+    dw.vRetry.className = "v soft";
+    dw.vRetry.textContent = t.retry || "none";
+    dw.vTags.className = "v soft";
+    dw.vTags.textContent = t.tags && t.tags.length ? t.tags.join(", ") : "—";
+
+    // stats
+    dw.vExec.textContent = t.run_count.toLocaleString();
+    dw.vErr.className = "v" + (t.error_count > 0 ? " red" : " soft");
+    dw.vErr.textContent = t.error_count.toLocaleString();
+    dw.vSkip.className = "v" + (t.skip_count > 0 ? " amber" : " soft");
+    dw.vSkip.textContent = t.skip_count.toLocaleString();
+    dw.vRej.className = "v" + (t.rejected_count > 0 ? " red" : " soft");
+    dw.vRej.textContent = t.rejected_count.toLocaleString();
+    dw.vRate.textContent = t.run_count > 0 ? (((t.run_count - t.error_count) / t.run_count) * 100).toFixed(1) + "%" : "—";
+    dw.vLast.className = "v soft";
+    dw.vLast.textContent = t.lastMs ? fmtRel(t.lastMs, n) : "never";
+    dw.errBox.style.display = t.last_error ? "" : "none";
+    dw.errBox.textContent = t.last_error;
+
+    // events
+    var evs = (data.events || []).filter(function (ev) { return ev.task === t.name; }).slice(0, 7);
+    var sig = evs.length + ":" + (evs.length ? evs[0].at + evs[0].kind : "");
+    if (sig !== dw.evSig) {
+      dw.evSig = sig;
+      dw.evList.textContent = "";
+      if (!evs.length) {
+        dw.evList.appendChild(h("div", "mini-empty2", "No recent events for this task."));
+      }
+      evs.forEach(function (ev) {
+        var row = h("div", "mini2 k-" + ev.kind);
+        row.appendChild(h("span", "t num", fmtTime(ev.atMs)));
+        row.appendChild(h("span", "badge", EV_GLYPH[ev.kind] || "•"));
+        row.appendChild(h("span", "msg", ev.message));
+        row.appendChild(h("span", "dur num", ev.duration_ms > 0 ? fmtDur(ev.duration_ms) : ""));
+        dw.evList.appendChild(row);
+      });
+    }
+  }
+
+  function renderDanger() {
+    if (!dw) return;
+    dw.dangerBody.textContent = "";
+    if (!dw.confirming) {
+      var btn = h("button", "btn2 danger", "Remove task");
+      btn.addEventListener("click", function () { dw.confirming = true; renderDanger(); });
+      dw.dangerBody.appendChild(btn);
+    } else {
+      var row = h("div", "confirm2");
+      row.appendChild(h("span", "q", "Remove “" + selName + "” and its statistics?"));
+      var yes = h("button", "btn2 dangerfill", "Remove");
+      var no = h("button", "btn2", "Keep");
+      yes.addEventListener("click", function () {
+        var name = selName;
+        act(name, "remove").then(function (ok) {
+          if (ok) { toast(name + " removed"); closeDrawer(); poll(); }
+        });
+      });
+      no.addEventListener("click", function () { dw.confirming = false; renderDanger(); });
+      row.appendChild(yes); row.appendChild(no);
+      dw.dangerBody.appendChild(row);
+    }
+  }
+
+  /* ---------------- schedule editor ---------------- */
+  var previewTimer = null;
+
+  function startEdit() {
+    var t = findTask(selName);
+    if (!t || !dw || !t.expr) return;
+    editing = true;
+    dw.editBtn.style.display = "none";
+    dw.schedView.style.display = "none";
+    var ed = dw.schedEdit;
+    ed.style.display = "";
+    ed.textContent = "";
+
+    var input = h("input", "field2");
+    input.value = t.expr;
+    input.placeholder = "every 90s · fixed-delay 5m · 0 */5 * * * ?";
+    input.spellcheck = false;
+    ed.appendChild(input);
+
+    var chips = h("div", "chips2");
+    SCHED_PRESETS.forEach(function (p) {
+      var c = h("button", "chip2", p.label);
+      c.addEventListener("click", function () { input.value = p.value; schedulePreview(); });
+      chips.appendChild(c);
+    });
+    ed.appendChild(chips);
+
+    var msg = h("div", "pmsg");
+    msg.style.display = "none";
+    ed.appendChild(msg);
+    var firesBox = h("div", "fires2");
+    firesBox.style.display = "none";
+    ed.appendChild(firesBox);
+
+    var actsRow = h("div", "edacts2");
+    var apply = h("button", "btn2 primary grow", "Apply schedule");
+    apply.disabled = true;
+    var cancel = h("button", "btn2", "Cancel");
+    actsRow.appendChild(apply); actsRow.appendChild(cancel);
+    ed.appendChild(actsRow);
+
+    function schedulePreview() {
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(runPreview, 250);
+    }
+    function runPreview() {
+      var expr = input.value.trim();
+      if (!expr) {
+        msg.style.display = "none"; firesBox.style.display = "none";
+        input.classList.remove("bad"); apply.disabled = true;
+        return;
+      }
+      api("/schedule/preview?expr=" + encodeURIComponent(expr)).then(function (j) {
+        if (input.value.trim() !== expr) return;
+        if (j.ok) {
+          input.classList.remove("bad");
+          apply.disabled = false;
+          msg.className = "pmsg ok";
+          msg.style.display = "";
+          msg.textContent = "";
+          msg.appendChild(document.createTextNode("✓ "));
+          msg.appendChild(h("b", null, j.meaning || j.expr));
+          msg.appendChild(document.createTextNode(" — next fires:"));
+          firesBox.style.display = "";
+          firesBox.textContent = "";
+          (j.next || []).forEach(function (f) {
+            var row = h("div", "fire2");
+            row.appendChild(h("b", null, fmtTime(f)));
+            row.appendChild(document.createTextNode(" — in " + fmtInShort(f - now())));
+            firesBox.appendChild(row);
+          });
+        } else {
+          input.classList.add("bad");
+          apply.disabled = true;
+          msg.className = "pmsg bad";
+          msg.style.display = "";
+          msg.textContent = "✕ " + (j.error || "invalid expression");
+          firesBox.style.display = "none";
+        }
+      }).catch(function () {});
+    }
+    input.addEventListener("input", schedulePreview);
+    input.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && !apply.disabled) applyNow();
+      if (e.key === "Escape") { e.stopPropagation(); stopEdit(); }
+    });
+    cancel.addEventListener("click", stopEdit);
+    function applyNow() {
+      var expr = input.value.trim();
+      act(selName, "schedule", { expr: expr }).then(function (ok) {
+        if (ok) {
+          toast(selName + " rescheduled");
+          stopEdit();
+          fetchFires(expr);
+          poll();
+        }
+      });
+    }
+    apply.addEventListener("click", applyNow);
+
+    input.focus();
+    runPreview();
+  }
+  function stopEdit() {
+    editing = false;
+    if (!dw) return;
+    dw.schedEdit.style.display = "none";
+    dw.schedEdit.textContent = "";
+    dw.schedView.style.display = "";
+    dw.editBtn.style.display = "";
+    renderDrawer();
+  }
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") {
+      if (editing) stopEdit();
+      else if (dw) closeDrawer();
+    }
+  });
+
+  /* ---------------- poll & tick ---------------- */
+  function parsePayload(j) {
+    j.tasks.forEach(function (t) {
+      t.nextMs = t.next_run || 0;
+      t.lastMs = t.last_run || 0;
+      t.upcomingMs = t.upcoming || [];
+    });
+    (j.events || []).forEach(function (ev) { ev.atMs = ev.at; });
+    return j;
+  }
+
+  var polling = false;
+  function poll() {
+    if (polling) return;
+    polling = true;
+    fetch(API + "/state?window=" + windowSec, { cache: "no-store" })
+      .then(function (res) {
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return res.json();
+      })
+      .then(function (j) {
+        data = parsePayload(j);
+        clockSkew = j.now - Date.now();
+        online = true;
+        renderAll();
+      })
+      .catch(function () {
+        online = false;
+        renderPill();
+      })
+      .finally(function () { polling = false; });
+  }
+
+  function renderAll() {
+    if (!data) return;
+    renderPill();
+    renderClock();
+    renderOverview();
+    renderTasksSub();
+    renderRuler();
+    renderRows();
+    renderActivity();
+    renderDrawer();
+  }
+
+  function tick() {
+    renderClock();
+    if (!data) return;
+    renderPill();
+    rowMap.forEach(function (r) { if (r.task) updateRow(r); });
+    renderDrawer();
+  }
+
+  buildOverview();
+  poll();
+  setInterval(poll, 2000);
+  setInterval(tick, 1000);
+})();
+</script>
+</body>
+</html>

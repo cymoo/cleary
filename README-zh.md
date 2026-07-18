@@ -20,9 +20,10 @@ DSL 提供，无需注解处理或反射。
 - **超时** —— 中断超时的执行，并支持通过 `isCancelled` 协作式取消
 - **Misfire 策略** —— 系统休眠后默认跳过错过的触发点，也可选择全部补跑
 - **并发保护** —— 默认跳过重叠执行（可按任务启用并发）
-- **动态任务管理** —— 支持运行时注册、禁用、启用、替换和删除任务
+- **动态任务管理** —— 支持运行时注册、禁用、启用、替换、改排程和删除任务
+- **内置 Web Dashboard** —— 零依赖的实时监控与管理界面
 - **显式执行结果** —— 区分成功、失败、跳过和拒绝
-- **可观测性钩子** —— 全局与任务级生命周期回调；未配置钩子时有默认日志兜底
+- **可观测性钩子** —— 全局与任务级生命周期回调、多播监听器；未配置钩子时有默认日志兜底
 - **标签** —— 任务分组，`listTasks(tag)` 过滤运行时快照
 - **共享上下文** —— 无需闭包即可向任务注入服务或数据
 
@@ -425,6 +426,19 @@ tasks.task("payment-sync") {
 }
 ```
 
+### 监听器
+
+config 钩子是单槽属性；当多个观察方需要同一批事件（指标、日志、内置 dashboard）时，
+注册 `TaskLifecycleListener`——数量不限：
+
+```kotlin
+tasks.addListener(object : TaskLifecycleListener {
+    override fun onTaskComplete(event: TaskCompleteEvent) = metrics.record(event)
+})
+```
+
+监听器在任务级和全局钩子之后触发，异常同样被隔离。
+
 ### 默认日志
 
 未配置相应钩子时，Cleary 通过 JDK `System.Logger`（logger 名
@@ -452,6 +466,10 @@ tasks.replace("new-poller") {
     run { pollV2() }
 }
 
+// 只换 schedule——任务体、设置和统计全部保留
+tasks.reschedule("new-poller", Schedule.FixedRate(1.minutes))
+tasks.reschedule("new-poller", null)   // 变为仅手动触发
+
 println(tasks.listTaskNames())
 println(tasks.listTasks())               // 全部任务的 List<TaskInfo>
 println(tasks.listTasks("polling"))      // 仅带 "polling" 标签的任务
@@ -466,6 +484,50 @@ tasks.remove("new-poller")
 * `TaskInfo` 同时包含静态元数据（`scheduleDescription`、`allowConcurrent`、
   `retryPolicy`、`timeout`、`tags`）和运行时字段（`activeExecutions`、`running`、
   下一次/上一次时间、最近耗时/错误，以及成功、失败、跳过、拒绝计数）
+
+---
+
+## Web Dashboard
+
+Cleary 内置了一个 Web 管理界面，由 JDK 自带的 HTTP 服务器提供——零额外依赖。
+它实时展示调度器状态（概览计数、每个任务未来触发点的时间轴、以及完成/失败/重试/
+超时/跳过/拒绝的活动流），并支持在浏览器中手动运行、暂停/恢复、删除和修改排程
+（带实时表达式预览）。支持明暗主题。
+
+```kotlin
+import io.github.cymoo.cleary.dashboard.Dashboard
+
+val dashboard = Dashboard(scheduler).start(port = 8378)
+println("Dashboard at http://localhost:${dashboard.port}")
+// ...
+dashboard.stop()
+```
+
+配置项：
+
+```kotlin
+Dashboard(scheduler) {
+    eventHistoryLimit = 300   // 活动流保留条数
+    readOnly = true           // 所有修改类端点返回 403
+}.start(port = 0)             // port 0 绑定随机端口，从 dashboard.port 读取
+```
+
+排程编辑器接受 `every <时长>`（`every 90s`、`every 1h30m`）、`fixed-delay <时长>`、
+`once <ISO-8601 时刻>` 或 Quartz cron 表达式；修改通过 `reschedule` 应用，统计数据保留。
+
+服务器默认绑定 `127.0.0.1` 且**无鉴权**——如需对外暴露，请置于带鉴权的反向代理之后，
+或开启 `readOnly`。
+
+页面背后是一个也可直接调用的 JSON API：
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/state?window=秒数` | 全量快照：统计、任务（含未来触发点）、最近事件 |
+| `GET /api/schedule/preview?expr=…` | 校验表达式并预测接下来的触发时间 |
+| `POST /api/tasks/{name}/run` · `/pause` · `/resume` · `/remove` | 控制操作 |
+| `POST /api/tasks/{name}/schedule` | 改排程；请求体 `{"expr": "every 30s"}` |
+
+可运行的演示见 [`examples/task-dashboard`](examples/task-dashboard)。
 
 ---
 
@@ -567,8 +629,9 @@ tasks.await()
 
 ## 常见示例
 
-可运行的 Web UI 示例见 [`examples/task-dashboard`](examples/task-dashboard)。它使用
-Colleen Web 框架提供任务管理 dashboard，可运行、启用、停用、移除和重置演示任务。
+内置 Web Dashboard 的可运行演示见 [`examples/task-dashboard`](examples/task-dashboard)：
+一组覆盖固定频率、固定间隔、cron、一次性、重试、超时和手动任务的示例，
+在 `http://localhost:8000` 监控管理。
 
 更多可直接复制的示例（快速开始、cron、重试退避、超时与协作取消、可观测性、共享上下文、
 并发控制、一次性任务、动态管理、`await()` 长驻进程、手动执行传参）见

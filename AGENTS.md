@@ -22,29 +22,41 @@ cleary/
 ├── README-zh.md
 ├── pom.xml
 ├── examples/
-│   └── task-dashboard/              # runnable Colleen dashboard example
+│   └── task-dashboard/              # runnable demo of the built-in dashboard
 └── src/
     ├── main/kotlin/io/github/cymoo/cleary/
     │   ├── TaskScheduler.kt          # scheduler lifecycle, queueing, execution
-    │   ├── TaskSchedulerConfig.kt    # config, events, TaskRunResult, TaskInfo
+    │   ├── TaskSchedulerConfig.kt    # config, events, listener, TaskRunResult, TaskInfo
     │   ├── TaskBuilder.kt            # task DSL and RetryPolicy
-    │   ├── Schedule.kt               # schedules, triggers, duration extensions
-    │   └── TaskContext.kt            # per-execution context API
+    │   ├── Schedule.kt               # schedules, Trigger interface, trigger impls
+    │   ├── TaskContext.kt            # per-execution context API
+    │   └── dashboard/                # built-in web dashboard (zero-dependency)
+    │       ├── Dashboard.kt          # embedded HTTP server + JSON API
+    │       ├── ScheduleExpr.kt       # textual schedule expressions
+    │       └── Json.kt               # minimal JSON writer
+    ├── main/resources/io/github/cymoo/cleary/dashboard/
+    │   ├── index.html                # single-page UI (design shared with mita)
+    │   └── styles.css
     └── test/kotlin/io/github/cymoo/cleary/
-        └── TaskSchedulerTest.kt      # JUnit 5 coverage for public behavior
+        ├── TaskSchedulerTest.kt      # JUnit 5 coverage for scheduler behavior
+        └── DashboardTest.kt          # reschedule/listener + dashboard HTTP coverage
 ```
 
-Production code is split by concern but remains in the single package
-`io.github.cymoo.cleary`:
+Scheduler code lives in the single package `io.github.cymoo.cleary`; the
+dashboard is the one subpackage:
 
 | File | Key types / responsibilities |
 |---|---|
-| `TaskScheduler.kt` | public API: `taskScheduler`, `task`, `replace`, `start`, `shutdown`, `await`, `run`, `runBlocking`, `enable`, `disable`, `remove`, `exists`, `listTaskNames`, `listTasks`, `getTaskInfo`; internal queue dispatch (fires, retries, timeouts) and execution accounting |
-| `TaskSchedulerConfig.kt` | configuration DSL, `MisfirePolicy`, lifecycle/result enums, event payloads, `TaskRunResult`, `TaskInfo`, `TaskTimeoutException` |
+| `TaskScheduler.kt` | public API: `taskScheduler`, `task`, `replace`, `reschedule`, `start`, `shutdown`, `await`, `run`, `runBlocking`, `enable`, `disable`, `remove`, `exists`, `listTaskNames`, `listTasks`, `getTaskInfo`, `addListener`/`removeListener`; internal queue dispatch (fires, retries, timeouts) and execution accounting |
+| `TaskSchedulerConfig.kt` | configuration DSL, `MisfirePolicy`, `TaskLifecycleListener`, lifecycle/result enums, event payloads, `TaskRunResult`, `TaskInfo`, `TaskTimeoutException` |
 | `TaskBuilder.kt` | `TaskBuilder` DSL receiver (schedules, timeout, tags, per-task hooks) and `RetryPolicy` backoff calculation |
 | `Schedule.kt` | `Schedule` sealed class, public `Trigger` interface, cron/fixed-rate/fixed-delay/once/custom trigger implementations |
 | `TaskContext.kt` | `TaskContext` interface, reified typed accessors, copy-on-write per-execution implementation |
-| `examples/task-dashboard/` | runnable web UI demonstrating grouping, manual runs, enable/disable/remove/reset, counters, and history (still targets the 0.2.x API) |
+| `dashboard/Dashboard.kt` | built-in web dashboard on the JDK `HttpServer` (zero deps): JSON API, action endpoints, event ring buffer via a lifecycle listener |
+| `dashboard/ScheduleExpr.kt` | textual schedule expressions (`every 90s`, `fixed-delay 5m`, `once <iso>`, cron) — parse, canonical form, humanizer |
+| `dashboard/Json.kt` | minimal JSON writer + tiny field extractor (no serialization dependency) |
+| `src/main/resources/io/github/cymoo/cleary/dashboard/` | embedded `index.html` + `styles.css` (single-page UI shared with the mita project's design; polls `/api/state`) |
+| `examples/task-dashboard/` | thin runnable demo: registers showcase tasks and starts the built-in dashboard |
 
 ## Build & Test Commands
 
@@ -141,3 +153,12 @@ mvn deploy -P release
   scheduler errors at `ERROR`.
 - **Durations**: the public API uses `kotlin.time.Duration` with `java.time.Duration`
   overloads on every DSL function; do not reintroduce custom duration extensions.
+- **Listeners vs hooks**: config hooks are single-slot; `TaskLifecycleListener`
+  (via `addListener`) is the multicast path and fires after the hooks. The
+  dashboard observes exclusively through a listener — never let it claim hooks.
+- **Dashboard**: `io.github.cymoo.cleary.dashboard` stays zero-dependency (JDK
+  `HttpServer`, hand-rolled JSON) and binds 127.0.0.1 without auth by design.
+  It reaches scheduler internals (`scheduleOf`, `upcomingFireTimes`,
+  `startedAtMillis`, `workerConcurrency`) through `internal` members — keep such
+  accessors internal, not public. Upcoming-fire projection is only exact for pure
+  grid triggers (fixed-rate, cron); never simulate stateful triggers (`Once`).
