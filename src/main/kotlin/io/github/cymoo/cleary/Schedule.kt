@@ -4,23 +4,39 @@ import com.cronutils.model.CronType
 import com.cronutils.model.definition.CronDefinitionBuilder
 import com.cronutils.model.time.ExecutionTime
 import com.cronutils.parser.CronParser
-import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.floor
+import kotlin.time.Duration
+import kotlin.time.toKotlinDuration
 
 /** Declarative schedule attached to a task. */
 sealed class Schedule {
     /** Quartz-compatible cron expression with its evaluation time zone. */
     data class Cron(val expression: String, val zone: ZoneId = ZoneId.systemDefault()) : Schedule()
 
-    /** Fixed-rate interval; executions are anchored to planned trigger time. */
+    /**
+     * Fixed-rate interval; fire times are anchored to the planned schedule grid,
+     * so execution latency never shifts the schedule.
+     */
     data class FixedRate(val interval: Duration) : Schedule() {
+        constructor(interval: java.time.Duration) : this(interval.toKotlinDuration())
+
         init {
-            require(!interval.isZero && !interval.isNegative && interval.toMillis() > 0) {
+            require(interval.inWholeMilliseconds > 0) {
                 "FixedRate interval must be at least 1 ms, got: $interval"
+            }
+        }
+    }
+
+    /** Interval measured from the completion of the previous scheduled run. */
+    data class FixedDelay(val interval: Duration) : Schedule() {
+        constructor(interval: java.time.Duration) : this(interval.toKotlinDuration())
+
+        init {
+            require(interval.inWholeMilliseconds > 0) {
+                "FixedDelay interval must be at least 1 ms, got: $interval"
             }
         }
     }
@@ -28,30 +44,31 @@ sealed class Schedule {
     /** One-shot execution at [at]. */
     data class Once(val at: Instant) : Schedule()
 
-    /** Wrapper that delays only the first execution of [schedule]. */
-    data class WithInitialDelay(val delay: Duration, val schedule: Schedule) : Schedule() {
-        init {
-            require(!delay.isNegative) { "WithInitialDelay.delay must be non-negative, got: $delay" }
-        }
-    }
+    /** User-provided [Trigger]; [description] is surfaced in [TaskInfo.scheduleDescription]. */
+    data class Custom(val trigger: Trigger, val description: String = "custom") : Schedule()
 
-    internal fun toTrigger(): Trigger = when (this) {
-        is Cron -> CronTrigger(expression, zone)
-        is FixedRate -> FixedRateTrigger(interval)
-        is Once -> OnceTrigger(at)
-        is WithInitialDelay -> InitialDelayTrigger(delay, schedule.toTrigger())
+    internal fun toTrigger(initialDelay: Duration?): Trigger {
+        val delayMs = initialDelay?.inWholeMilliseconds
+        return when (this) {
+            is Cron -> CronTrigger(expression, zone).withInitialDelay(delayMs)
+            is FixedRate -> FixedRateTrigger(interval.inWholeMilliseconds, delayMs)
+            is FixedDelay -> FixedDelayTrigger(interval.inWholeMilliseconds, delayMs)
+            is Once -> OnceTrigger(saturatedAdd(at.toEpochMilli(), delayMs ?: 0))
+            is Custom -> trigger.withInitialDelay(delayMs)
+        }
     }
 
     internal fun describe(): String = when (this) {
         is Cron -> "cron[$zone]: $expression"
         is FixedRate -> "every ${interval.toMillisDescription()}"
+        is FixedDelay -> "fixed-delay ${interval.toMillisDescription()}"
         is Once -> "once at $at"
-        is WithInitialDelay -> "initial-delay ${delay.toMillisDescription()}, then ${schedule.describe()}"
+        is Custom -> description
     }
 }
 
-private fun Duration.toMillisDescription(): String {
-    val ms = toMillis()
+internal fun Duration.toMillisDescription(): String {
+    val ms = inWholeMilliseconds
     return when {
         ms % 3_600_000L == 0L -> "${ms / 3_600_000L}h"
         ms % 60_000L == 0L -> "${ms / 60_000L}m"
@@ -60,8 +77,29 @@ private fun Duration.toMillisDescription(): String {
     }
 }
 
-internal interface Trigger {
-    fun nextExecutionTime(lastScheduledTime: Long): Long?
+/**
+ * Computes fire times (epoch milliseconds) for a task's schedule stream.
+ *
+ * Implementations must be thread-safe: the scheduler may call a trigger from its
+ * dispatch thread and from threads invoking [TaskScheduler.enable].
+ */
+interface Trigger {
+    /**
+     * First fire time for a stream armed at [armTime] (when the scheduler starts, the
+     * task is registered, or the task is re-enabled), or null if the stream never fires.
+     * The result may be in the past; a past time fires immediately.
+     */
+    fun initialExecutionTime(armTime: Long): Long?
+
+    /**
+     * Next fire time strictly after [minTime], or null to end the stream.
+     *
+     * [lastScheduledTime] is the previous planned fire time and anchors grid-based
+     * schedules. [minTime] is always >= [lastScheduledTime]; under [MisfirePolicy.SKIP]
+     * it is the current time (so missed slots are skipped), under
+     * [MisfirePolicy.CATCH_UP] it equals [lastScheduledTime].
+     */
+    fun nextExecutionTime(lastScheduledTime: Long, minTime: Long): Long?
 }
 
 internal class CronTrigger(expression: String, private val zone: ZoneId) : Trigger {
@@ -71,8 +109,14 @@ internal class CronTrigger(expression: String, private val zone: ZoneId) : Trigg
         throw IllegalArgumentException("Invalid cron expression: '$expression'", e)
     }
 
-    override fun nextExecutionTime(lastScheduledTime: Long): Long? {
-        val base = ZonedDateTime.ofInstant(Instant.ofEpochMilli(lastScheduledTime), zone)
+    // base - 1 so that a cron point exactly at the arm time still fires
+    override fun initialExecutionTime(armTime: Long): Long? = nextAfter(armTime - 1)
+
+    override fun nextExecutionTime(lastScheduledTime: Long, minTime: Long): Long? =
+        nextAfter(minTime)
+
+    private fun nextAfter(baseMs: Long): Long? {
+        val base = ZonedDateTime.ofInstant(Instant.ofEpochMilli(baseMs), zone)
         return executionTime.nextExecution(base).map { it.toInstant().toEpochMilli() }.orElse(null)
     }
 
@@ -82,69 +126,66 @@ internal class CronTrigger(expression: String, private val zone: ZoneId) : Trigg
     }
 }
 
-internal class FixedRateTrigger(private val interval: Duration) : Trigger {
-    override fun nextExecutionTime(lastScheduledTime: Long): Long =
-        lastScheduledTime + interval.toMillis()
+/** Shared arm logic for interval-based triggers: first fire at arm + (initialDelay ?: interval). */
+internal abstract class IntervalTrigger(
+    protected val intervalMs: Long,
+    private val initialDelayMs: Long?
+) : Trigger {
+    final override fun initialExecutionTime(armTime: Long): Long =
+        saturatedAdd(armTime, initialDelayMs ?: intervalMs)
 }
 
-internal class OnceTrigger(private val at: Instant) : Trigger {
-    private val fired = AtomicBoolean(false)
-    override fun nextExecutionTime(lastScheduledTime: Long): Long? =
-        if (fired.compareAndSet(false, true)) at.toEpochMilli() else null
+internal class FixedRateTrigger(intervalMs: Long, initialDelayMs: Long?) :
+    IntervalTrigger(intervalMs, initialDelayMs) {
+
+    override fun nextExecutionTime(lastScheduledTime: Long, minTime: Long): Long {
+        // Jump over missed slots in one step while staying on the original grid.
+        val steps = (minTime - lastScheduledTime) / intervalMs + 1
+        if (steps >= Long.MAX_VALUE / intervalMs) return Long.MAX_VALUE
+        return saturatedAdd(lastScheduledTime, steps * intervalMs)
+    }
 }
 
-internal class InitialDelayTrigger(
-    private val delay: Duration,
+internal class FixedDelayTrigger(intervalMs: Long, initialDelayMs: Long?) :
+    IntervalTrigger(intervalMs, initialDelayMs) {
+
+    // lastScheduledTime is the completion time of the previous run; misfire does not apply.
+    override fun nextExecutionTime(lastScheduledTime: Long, minTime: Long): Long =
+        saturatedAdd(lastScheduledTime, intervalMs)
+}
+
+internal class OnceTrigger(private val atMs: Long) : Trigger {
+    private val consumed = AtomicBoolean(false)
+
+    override fun initialExecutionTime(armTime: Long): Long? =
+        if (consumed.get()) null else atMs
+
+    override fun nextExecutionTime(lastScheduledTime: Long, minTime: Long): Long? {
+        consumed.set(true)
+        return null
+    }
+}
+
+internal class DelayedTrigger(
+    private val delayMs: Long,
     private val inner: Trigger
 ) : Trigger {
-    private val initialized = AtomicBoolean(false)
+    override fun initialExecutionTime(armTime: Long): Long? =
+        inner.initialExecutionTime(saturatedAdd(armTime, delayMs))
 
-    override fun nextExecutionTime(lastScheduledTime: Long): Long? =
-        if (initialized.compareAndSet(false, true)) {
-            val innerFirst = inner.nextExecutionTime(lastScheduledTime) ?: return null
-            innerFirst + delay.toMillis()
-        } else {
-            inner.nextExecutionTime(lastScheduledTime)
-        }
+    override fun nextExecutionTime(lastScheduledTime: Long, minTime: Long): Long? =
+        inner.nextExecutionTime(lastScheduledTime, minTime)
 }
 
-private fun Double.toDurationOfSeconds(): Duration {
-    val seconds = floor(this).toLong()
-    val nanos = ((this - seconds) * 1_000_000_000L).toLong()
-    return Duration.ofSeconds(seconds, nanos)
+private fun Trigger.withInitialDelay(delayMs: Long?): Trigger =
+    if (delayMs == null) this else DelayedTrigger(delayMs, this)
+
+/** Addition that clamps at Long.MAX_VALUE/MIN_VALUE instead of wrapping around. */
+internal fun saturatedAdd(a: Long, b: Long): Long {
+    val sum = a + b
+    return if ((a xor sum) and (b xor sum) < 0) {
+        if (a > 0) Long.MAX_VALUE else Long.MIN_VALUE
+    } else {
+        sum
+    }
 }
-
-val Int.millisecond: Duration get() = toLong().millisecond
-val Int.milliseconds: Duration get() = toLong().milliseconds
-val Long.millisecond: Duration get() = Duration.ofMillis(this)
-val Long.milliseconds: Duration get() = Duration.ofMillis(this)
-val Double.millisecond: Duration get() = (this / 1_000).toDurationOfSeconds()
-val Double.milliseconds: Duration get() = millisecond
-
-val Int.second: Duration get() = toLong().second
-val Int.seconds: Duration get() = toLong().seconds
-val Long.second: Duration get() = Duration.ofSeconds(this)
-val Long.seconds: Duration get() = Duration.ofSeconds(this)
-val Double.second: Duration get() = toDurationOfSeconds()
-val Double.seconds: Duration get() = second
-
-val Int.minute: Duration get() = toLong().minute
-val Int.minutes: Duration get() = toLong().minutes
-val Long.minute: Duration get() = Duration.ofMinutes(this)
-val Long.minutes: Duration get() = Duration.ofMinutes(this)
-val Double.minute: Duration get() = (this * 60).toDurationOfSeconds()
-val Double.minutes: Duration get() = minute
-
-val Int.hour: Duration get() = toLong().hour
-val Int.hours: Duration get() = toLong().hours
-val Long.hour: Duration get() = Duration.ofHours(this)
-val Long.hours: Duration get() = Duration.ofHours(this)
-val Double.hour: Duration get() = (this * 3_600).toDurationOfSeconds()
-val Double.hours: Duration get() = hour
-
-val Int.day: Duration get() = toLong().day
-val Int.days: Duration get() = toLong().days
-val Long.day: Duration get() = Duration.ofDays(this)
-val Long.days: Duration get() = Duration.ofDays(this)
-val Double.day: Duration get() = (this * 86_400).toDurationOfSeconds()
-val Double.days: Duration get() = day

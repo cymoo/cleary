@@ -6,7 +6,7 @@
 
     <groupId>io.github.cymoo</groupId>
     <artifactId>cleary</artifactId>
-    <version>0.2.0</version>
+    <version>0.3.0</version>
 
     <!-- Project Information (Required for Maven Central) -->
     <name>Cleary</name>
@@ -42,11 +42,12 @@
 
     <properties>
         <!-- Java & Kotlin versions -->
-        <java.version>11</java.version>
+        <java.version>21</java.version>
         <kotlin.version>2.3.0</kotlin.version>
 
         <!-- Dependency versions -->
         <cron-utils.version>9.2.1</cron-utils.version>
+        <colleen.version>0.5.0</colleen.version>
         <junit.version>5.10.2</junit.version>
 
         <!-- Build configuration -->
@@ -74,6 +75,13 @@
             <groupId>com.cronutils</groupId>
             <artifactId>cron-utils</artifactId>
             <version>${cron-utils.version}</version>
+        </dependency>
+        <!-- Optional: only needed for io.github.cymoo.cleary.dashboard (requires Java 21+) -->
+        <dependency>
+            <groupId>io.github.cymoo</groupId>
+            <artifactId>colleen</artifactId>
+            <version>${colleen.version}</version>
+            <optional>true</optional>
         </dependency>
         <dependency>
             <groupId>org.jetbrains.kotlin</groupId>
