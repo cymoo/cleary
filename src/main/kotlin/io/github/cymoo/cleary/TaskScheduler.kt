@@ -1,13 +1,13 @@
 package io.github.cymoo.cleary
 
-import java.util.concurrent.Callable
+import java.lang.System.Logger.Level
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.DelayQueue
 import java.util.concurrent.Delayed
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Future
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadFactory
@@ -17,10 +17,16 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
+import kotlin.time.Duration
+
+/** Creates and configures a [TaskScheduler]. */
+fun taskScheduler(block: TaskSchedulerConfig.() -> Unit = {}): TaskScheduler =
+    TaskScheduler(block)
 
 /**
- * A lightweight task scheduler supporting cron expressions, fixed-rate scheduling,
- * one-shot execution, retries, manual runs, and runtime task management.
+ * A lightweight task scheduler supporting cron expressions, fixed-rate and
+ * fixed-delay scheduling, one-shot execution, retries, timeouts, manual runs,
+ * and runtime task management.
  *
  * A [TaskScheduler] instance is single-use: after [shutdown] it cannot be started
  * again and no new tasks can be registered.
@@ -29,6 +35,9 @@ class TaskScheduler private constructor(
     private val config: TaskSchedulerConfig
 ) {
     companion object {
+        private val logger: System.Logger = System.getLogger("io.github.cymoo.cleary")
+        private const val SCHEDULER_JOIN_TIMEOUT_MS = 5_000L
+
         operator fun invoke(block: TaskSchedulerConfig.() -> Unit = {}): TaskScheduler =
             TaskScheduler(TaskSchedulerConfig().apply(block)).also { scheduler ->
                 if (scheduler.config.autoStart) scheduler.start()
@@ -52,15 +61,16 @@ class TaskScheduler private constructor(
         )
     }
 
-    private val taskQueue = DelayQueue<ScheduledTask>()
+    private val taskQueue = DelayQueue<QueueItem>()
     private val lifecycleState = AtomicReference(SchedulerState.NEW)
     private val schedulerThread = Thread(::runScheduler, "${config.threadNamePrefix}-scheduler")
         .apply { isDaemon = true }
-    private val tasks = java.util.concurrent.ConcurrentHashMap<String, TaskEntry>()
-    private val globalContext = java.util.concurrent.ConcurrentHashMap<String, Any>().apply {
-        putAll(config.context)
-    }
+    private val tasks = ConcurrentHashMap<String, TaskEntry>()
+    private val globalContext: Map<String, Any> = HashMap(config.context)
     private val shutdownLatch = CountDownLatch(1)
+
+    /** Executions whose future has not been settled yet; swept on shutdown so no caller hangs. */
+    private val livePendings = ConcurrentHashMap.newKeySet<PendingExecution>()
 
     /** Current lifecycle state of this single-use scheduler. */
     val state: SchedulerState get() = lifecycleState.get()
@@ -74,53 +84,59 @@ class TaskScheduler private constructor(
     /** Registers a task. Omitting a schedule creates a manual-only task. */
     fun task(name: String, block: TaskBuilder.() -> Unit) {
         ensureAcceptsConfiguration()
+        require(name.isNotBlank()) { "Task name cannot be blank" }
+        val entry = buildEntry(name, block, stats = TaskStats(), defaultEnabled = true)
+        require(tasks.putIfAbsent(name, entry) == null) { "Task '$name' is already registered" }
+        if (state == SchedulerState.RUNNING) armInitial(entry)
+    }
+
+    /**
+     * Replaces a registered task's definition while preserving its statistics and,
+     * unless [TaskBuilder.enabled] is set, its enabled state. In-flight executions
+     * of the previous definition run to completion.
+     */
+    fun replace(name: String, block: TaskBuilder.() -> Unit) {
+        ensureAcceptsConfiguration()
+        val old = tasks[name] ?: throw NoSuchElementException("Task '$name' not found")
+        val entry = buildEntry(name, block, stats = old.stats, defaultEnabled = old.enabled.get())
+        tasks[name] = entry
+        cancelStream(old)
+        if (state == SchedulerState.RUNNING) armInitial(entry)
+    }
+
+    private fun buildEntry(
+        name: String,
+        block: TaskBuilder.() -> Unit,
+        stats: TaskStats,
+        defaultEnabled: Boolean
+    ): TaskEntry {
         val builder = TaskBuilder(name).apply(block)
         val taskBlock = builder.taskBlock
-            ?: error("Task '$name': no run { } block defined")
-        register(
+        require(taskBlock != null) { "Task '$name': no run { } block defined" }
+        val schedule = builder.schedule
+        val initialDelay = builder.initialDelayValue
+        return TaskEntry(
             name = name,
-            schedule = builder.buildSchedule(),
+            schedule = schedule,
+            initialDelay = initialDelay,
+            trigger = schedule?.toTrigger(initialDelay),
             allowConcurrent = builder.allowConcurrent,
             retryPolicy = builder.retryPolicy,
+            timeout = builder.timeoutValue,
+            tags = builder.tagsValue,
+            hooks = builder.buildHooks(),
+            enabled = AtomicBoolean(builder.enabledValue ?: defaultEnabled),
+            stats = stats,
             block = taskBlock
         )
     }
 
-    private fun register(
-        name: String,
-        schedule: Schedule?,
-        allowConcurrent: Boolean,
-        retryPolicy: RetryPolicy?,
-        block: TaskContext.() -> Any?
-    ) {
-        require(name.isNotBlank()) { "Task name cannot be blank" }
-
-        val entry = TaskEntry(
-            name = name,
-            schedule = schedule,
-            trigger = schedule?.toTrigger(),
-            allowConcurrent = allowConcurrent,
-            retryPolicy = retryPolicy,
-            enabled = AtomicBoolean(true),
-            executing = AtomicBoolean(false),
-            stats = TaskStats(),
-            block = block
-        )
-        require(tasks.putIfAbsent(name, entry) == null) { "Task '$name' is already registered" }
-
-        if (state == SchedulerState.RUNNING && entry.trigger != null && entry.enabled.get()) {
-            enqueue(name, entry.trigger, entry)
-        }
-    }
-
-    /** Starts the scheduler and enqueues all enabled scheduled tasks. */
+    /** Starts the scheduler and arms all enabled scheduled tasks. */
     fun start() {
         when {
             lifecycleState.compareAndSet(SchedulerState.NEW, SchedulerState.RUNNING) -> {
                 schedulerThread.start()
-                tasks.values
-                    .filter { it.trigger != null && it.enabled.get() }
-                    .forEach { enqueue(it.name, it.trigger!!, it) }
+                tasks.values.forEach(::armInitial)
                 if (config.registerShutdownHook) {
                     Runtime.getRuntime().addShutdownHook(
                         Thread({ shutdown() }, "${config.threadNamePrefix}-shutdown-hook")
@@ -140,22 +156,31 @@ class TaskScheduler private constructor(
         schedulerThread.interrupt()
         if (previous == SchedulerState.RUNNING) {
             try {
-                schedulerThread.join(5_000)
+                schedulerThread.join(SCHEDULER_JOIN_TIMEOUT_MS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
         }
 
+        failPendingRetries()
+
         if (awaitTermination) {
             executor.shutdown()
             try {
-                if (!executor.awaitTermination(30, TimeUnit.SECONDS)) executor.shutdownNow()
+                if (!executor.awaitTermination(config.shutdownTimeout.inWholeMilliseconds, TimeUnit.MILLISECONDS)) {
+                    executor.shutdownNow()
+                }
             } catch (_: InterruptedException) {
                 executor.shutdownNow()
                 Thread.currentThread().interrupt()
             }
         } else {
             executor.shutdownNow()
+        }
+
+        // shutdownNow drops queued-but-unstarted attempts; settle their futures so no caller hangs.
+        for (pending in livePendings) {
+            finish(pending, null, pending.lastError ?: InterruptedException("Scheduler shut down"))
         }
 
         shutdownLatch.countDown()
@@ -170,11 +195,14 @@ class TaskScheduler private constructor(
         }
     }
 
-    /** Submits a registered task for immediate manual execution. */
-    fun run(name: String, contextValues: Map<String, Any> = emptyMap()): Future<TaskRunResult> {
+    /**
+     * Submits a registered task for immediate manual execution. Manual runs execute
+     * even when the task is disabled and never affect its schedule.
+     */
+    fun run(name: String, contextValues: Map<String, Any> = emptyMap()): CompletableFuture<TaskRunResult> {
         check(state == SchedulerState.RUNNING) { "TaskScheduler is not running" }
         val entry = tasks[name] ?: throw NoSuchElementException("Task '$name' not found")
-        return submit(entry, scheduledTime = null, contextValues = contextValues, type = TaskExecutionType.MANUAL)
+        return submitExecution(entry, scheduledTime = null, contextValues, TaskExecutionType.MANUAL)
     }
 
     /** Runs a task manually and waits for its explicit [TaskRunResult]. */
@@ -188,29 +216,28 @@ class TaskScheduler private constructor(
             TaskRunResult.Failure(e)
         }
 
-    /** Enables a task and schedules its next run if the scheduler is active. */
+    /** Enables a task and arms its schedule if the scheduler is active. */
     fun enable(name: String) {
         check(state != SchedulerState.SHUTDOWN) { "TaskScheduler has been shut down" }
         val entry = tasks[name] ?: throw NoSuchElementException("Task '$name' not found")
-        if (entry.enabled.compareAndSet(false, true) && state == SchedulerState.RUNNING && entry.trigger != null) {
-            enqueue(name, entry.trigger, entry)
+        if (entry.enabled.compareAndSet(false, true) && state == SchedulerState.RUNNING) {
+            armInitial(entry)
         }
     }
 
-    /** Disables a task and removes its pending scheduled triggers. */
+    /** Disables a task and cancels its pending scheduled fire. In-flight executions finish. */
     fun disable(name: String) {
         check(state != SchedulerState.SHUTDOWN) { "TaskScheduler has been shut down" }
         val entry = tasks[name] ?: throw NoSuchElementException("Task '$name' not found")
         entry.enabled.set(false)
-        taskQueue.removeIf { it.taskName == name }
+        cancelStream(entry)
         entry.stats.nextScheduledAt = null
     }
 
-    /** Removes a task from the registry and clears pending scheduled triggers. */
+    /** Removes a task from the registry and cancels its pending scheduled fire. */
     fun remove(name: String) {
         check(state != SchedulerState.SHUTDOWN) { "TaskScheduler has been shut down" }
-        tasks.remove(name)
-        taskQueue.removeIf { it.taskName == name }
+        tasks.remove(name)?.let(::cancelStream)
     }
 
     /** Returns whether a task is currently registered. */
@@ -219,24 +246,56 @@ class TaskScheduler private constructor(
     /** Lists registered task names in unspecified order. */
     fun listTaskNames(): List<String> = tasks.keys.toList()
 
+    /** Returns runtime snapshots of all registered tasks in unspecified order. */
+    fun listTasks(): List<TaskInfo> = tasks.values.map { it.toTaskInfo() }
+
+    /** Returns runtime snapshots of all registered tasks carrying [tag]. */
+    fun listTasks(tag: String): List<TaskInfo> =
+        tasks.values.filter { tag in it.tags }.map { it.toTaskInfo() }
+
     /** Returns a runtime snapshot for a task, or null when it is not registered. */
-    fun getTaskInfo(name: String): TaskInfo? {
-        val entry = tasks[name] ?: return null
-        return entry.toTaskInfo()
+    fun getTaskInfo(name: String): TaskInfo? = tasks[name]?.toTaskInfo()
+
+    // ------------------------------------------------------------------------
+    // Scheduling
+    // ------------------------------------------------------------------------
+
+    /**
+     * Arms a task's schedule stream. [TaskEntry.currentFire] guarantees at most one
+     * live [QueueItem.Fire] per entry, so concurrent arm attempts (registration
+     * during [start], rapid enable cycles) cannot create duplicate streams.
+     */
+    private fun armInitial(entry: TaskEntry) {
+        val trigger = entry.trigger ?: return
+        if (!entry.enabled.get()) return
+        val time = trigger.initialExecutionTime(System.currentTimeMillis())
+        if (time == null) {
+            entry.stats.nextScheduledAt = null
+            return
+        }
+        offerFire(entry, time)
     }
 
-    private fun enqueue(taskName: String, trigger: Trigger, entry: TaskEntry): Long? {
-        val nextTime = trigger.nextExecutionTime(System.currentTimeMillis() - 1)
-        entry.stats.nextScheduledAt = nextTime
-        if (nextTime != null) taskQueue.offer(ScheduledTask(taskName, nextTime))
-        return nextTime
+    private fun offerFire(entry: TaskEntry, time: Long) {
+        val fire = QueueItem.Fire(entry, time)
+        if (entry.currentFire.compareAndSet(null, fire)) {
+            entry.stats.nextScheduledAt = time
+            taskQueue.offer(fire)
+        }
+    }
+
+    private fun cancelStream(entry: TaskEntry) {
+        entry.currentFire.getAndSet(null)?.let { taskQueue.remove(it) }
     }
 
     private fun runScheduler() {
         while (state == SchedulerState.RUNNING) {
             try {
-                val scheduled = taskQueue.take()
-                dispatch(scheduled)
+                when (val item = taskQueue.take()) {
+                    is QueueItem.Fire -> dispatchFire(item)
+                    is QueueItem.Retry -> submitAttempt(item.pending)
+                    is QueueItem.Timeout -> fireTimeout(item.attempt)
+                }
             } catch (_: InterruptedException) {
                 break
             } catch (t: Throwable) {
@@ -245,122 +304,264 @@ class TaskScheduler private constructor(
         }
     }
 
-    private fun dispatch(scheduled: ScheduledTask) {
-        val entry = tasks[scheduled.taskName] ?: return
-        if (!entry.enabled.get()) return
-
-        val nextTime = entry.trigger?.nextExecutionTime(scheduled.scheduledTime)
-        entry.stats.nextScheduledAt = nextTime
-        if (nextTime != null) {
-            taskQueue.offer(ScheduledTask(scheduled.taskName, nextTime))
+    private fun dispatchFire(fire: QueueItem.Fire) {
+        val entry = fire.entry
+        if (tasks[entry.name] !== entry || !entry.enabled.get()) {
+            clearFire(entry, fire)
+            return
         }
-
-        submit(entry, scheduled.scheduledTime, emptyMap(), TaskExecutionType.SCHEDULED)
+        rearmFromFire(entry, fire)
+        submitExecution(entry, fire.time, emptyMap(), TaskExecutionType.SCHEDULED)
     }
 
-    private fun submit(
+    /** Re-arms the next fire before this one executes, so retries and slow runs never delay it. */
+    private fun rearmFromFire(entry: TaskEntry, fire: QueueItem.Fire) {
+        val trigger = entry.trigger ?: return
+        if (entry.rearmAfterCompletion) {
+            // FixedDelay: the next fire is armed when this execution completes.
+            clearFire(entry, fire)
+            return
+        }
+        val minTime = when (config.misfirePolicy) {
+            MisfirePolicy.CATCH_UP -> fire.time
+            MisfirePolicy.SKIP -> max(fire.time, System.currentTimeMillis())
+        }
+        val next = trigger.nextExecutionTime(fire.time, minTime)
+        if (next == null) {
+            clearFire(entry, fire)
+            return
+        }
+        val nextFire = QueueItem.Fire(entry, next)
+        if (entry.currentFire.compareAndSet(fire, nextFire)) {
+            entry.stats.nextScheduledAt = next
+            taskQueue.offer(nextFire)
+        }
+    }
+
+    private fun clearFire(entry: TaskEntry, fire: QueueItem.Fire) {
+        entry.currentFire.compareAndSet(fire, null)
+        entry.stats.nextScheduledAt = null
+    }
+
+    private fun rearmAfterCompletion(entry: TaskEntry) {
+        if (state != SchedulerState.RUNNING || tasks[entry.name] !== entry || !entry.enabled.get()) return
+        val trigger = entry.trigger ?: return
+        val now = System.currentTimeMillis()
+        val next = trigger.nextExecutionTime(now, now)
+        if (next != null) offerFire(entry, next) else entry.stats.nextScheduledAt = null
+    }
+
+    // ------------------------------------------------------------------------
+    // Execution
+    // ------------------------------------------------------------------------
+
+    private fun submitExecution(
         entry: TaskEntry,
         scheduledTime: Long?,
         contextValues: Map<String, Any>,
         type: TaskExecutionType
-    ): Future<TaskRunResult> =
+    ): CompletableFuture<TaskRunResult> {
+        val future = CompletableFuture<TaskRunResult>()
+        if (type == TaskExecutionType.SCHEDULED && entry.rearmAfterCompletion) {
+            future.whenComplete { _, _ -> rearmAfterCompletion(entry) }
+        }
+        // Fast-path overlap check: avoids burning a worker queue slot per skip.
+        if (!entry.allowConcurrent && entry.executing.get()) {
+            recordSkip(entry, scheduledTime, type)
+            future.complete(TaskRunResult.Skipped(entry.name, TaskSkipReason.ALREADY_RUNNING))
+            return future
+        }
+        val context = TaskContextImpl(entry.name, globalContext) { state == SchedulerState.SHUTDOWN }
+        context.seed(contextValues)
+        val pending = PendingExecution(entry, scheduledTime, type, context, future)
+        livePendings.add(pending)
+        submitAttempt(pending)
+        return future
+    }
+
+    private fun submitAttempt(pending: PendingExecution) {
         try {
-            executor.submit(Callable { executeOrSkip(entry, scheduledTime, contextValues, type) })
-        } catch (_: RejectedExecutionException) {
-            val event = TaskRejectedEvent(
-                taskName = entry.name,
-                scheduledTime = scheduledTime,
-                rejectedAt = System.currentTimeMillis(),
-                executionType = type,
-                reason = TaskRejectedReason.WORKER_QUEUE_FULL
-            )
-            entry.stats.rejectedCount.incrementAndGet()
-            safeHook(entry.name, SchedulerErrorPhase.ON_TASK_REJECTED) { config.onTaskRejected?.invoke(event) }
-            CompletableFuture.completedFuture(TaskRunResult.Rejected(entry.name, event.reason))
-        }
-
-    private fun executeOrSkip(
-        entry: TaskEntry,
-        scheduledTime: Long?,
-        contextValues: Map<String, Any>,
-        type: TaskExecutionType
-    ): TaskRunResult {
-        if (!entry.beginExecution()) {
-            val event = TaskSkippedEvent(
-                taskName = entry.name,
-                scheduledTime = scheduledTime,
-                skippedAt = System.currentTimeMillis(),
-                executionType = type,
-                reason = TaskSkipReason.ALREADY_RUNNING
-            )
-            entry.stats.skipCount.incrementAndGet()
-            safeHook(entry.name, SchedulerErrorPhase.ON_TASK_SKIPPED) { config.onTaskSkipped?.invoke(event) }
-            return TaskRunResult.Skipped(entry.name, event.reason)
-        }
-
-        return try {
-            executeTask(entry, contextValues, scheduledTime)
-        } finally {
-            entry.endExecution()
-        }
-    }
-
-    private fun executeTask(
-        entry: TaskEntry,
-        extra: Map<String, Any>,
-        scheduledTime: Long?
-    ): TaskRunResult {
-        val ctx = java.util.concurrent.ConcurrentHashMap(globalContext).apply { putAll(extra) }
-        val actualStartTime = System.currentTimeMillis()
-        val startEvent = TaskStartEvent(
-            taskName = entry.name,
-            scheduledTime = scheduledTime ?: actualStartTime,
-            actualTime = actualStartTime,
-            context = ctx
-        )
-        entry.stats.markStarted(actualStartTime)
-        safeHook(entry.name, SchedulerErrorPhase.ON_TASK_START) { config.onTaskStart?.invoke(startEvent) }
-
-        var lastError: Throwable? = null
-        var result: Any? = null
-        val maxAttempts = entry.retryPolicy?.maxAttempts ?: 1
-
-        for (failedAttempts in 0 until maxAttempts) {
-            try {
-                result = entry.block(TaskContextImpl(entry.name, ctx))
-                lastError = null
-                break
-            } catch (t: Throwable) {
-                lastError = t
-                val isLastAttempt = failedAttempts == maxAttempts - 1
-                if (!isLastAttempt) {
-                    val policy = entry.retryPolicy!!
-                    val delayMs = policy.delayForFailedAttempts(failedAttempts)
-                    val retryEvent = TaskRetryEvent(
-                        taskName = entry.name,
-                        failedAttempts = failedAttempts + 1,
-                        maxAttempts = maxAttempts,
-                        error = t,
-                        nextRetryDelayMs = delayMs
-                    )
-                    safeHook(entry.name, SchedulerErrorPhase.ON_RETRY) { config.onRetry?.invoke(retryEvent) }
-                    try {
-                        Thread.sleep(delayMs)
-                    } catch (ie: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        lastError = ie
-                        break
-                    }
+            executor.execute {
+                try {
+                    runAttempt(pending)
+                } catch (t: Throwable) {
+                    reportSchedulerError(pending.entry.name, SchedulerErrorPhase.SCHEDULER_LOOP, t)
+                    finish(pending, null, t)
                 }
             }
+        } catch (_: RejectedExecutionException) {
+            val lastError = pending.lastError
+            if (pending.started && lastError != null) {
+                // A retry attempt could not be queued: settle with the last failure.
+                finish(pending, null, lastError)
+            } else {
+                recordRejected(pending.entry, pending.scheduledTime, pending.type)
+                settle(pending, TaskRunResult.Rejected(pending.entry.name, TaskRejectedReason.WORKER_QUEUE_FULL))
+            }
+        }
+    }
+
+    private fun runAttempt(pending: PendingExecution) {
+        // Clear any interrupt a previous attempt's timeout watchdog may have leaked onto this thread.
+        Thread.interrupted()
+        val entry = pending.entry
+        if (!pending.started) {
+            if (!entry.beginExecution()) {
+                recordSkip(entry, pending.scheduledTime, pending.type)
+                settle(pending, TaskRunResult.Skipped(entry.name, TaskSkipReason.ALREADY_RUNNING))
+                return
+            }
+            pending.started = true
+            pending.startedAt = System.currentTimeMillis()
+            entry.stats.markStarted(pending.startedAt)
+            val startEvent = TaskStartEvent(
+                taskName = entry.name,
+                scheduledTime = pending.scheduledTime ?: pending.startedAt,
+                actualTime = pending.startedAt,
+                context = pending.context
+            )
+            fireHooks(entry.name, SchedulerErrorPhase.ON_TASK_START, startEvent, entry.hooks.onStart, config.onTaskStart)
         }
 
-        val endTime = System.currentTimeMillis()
-        val completeEvent = TaskCompleteEvent(entry.name, actualStartTime, endTime, result, lastError)
-        entry.stats.markCompleted(completeEvent)
-        safeHook(entry.name, SchedulerErrorPhase.ON_TASK_COMPLETE) { config.onTaskComplete?.invoke(completeEvent) }
+        val timeout = entry.timeout
+        var attempt: Attempt? = null
+        var timeoutItem: QueueItem.Timeout? = null
+        if (timeout != null) {
+            attempt = Attempt(Thread.currentThread())
+            timeoutItem = QueueItem.Timeout(
+                attempt,
+                saturatedAdd(System.currentTimeMillis(), timeout.inWholeMilliseconds)
+            )
+            taskQueue.offer(timeoutItem)
+        }
 
-        return if (lastError == null) TaskRunResult.Success(result) else TaskRunResult.Failure(lastError!!)
+        var result: Any? = null
+        var error: Throwable? = null
+        try {
+            result = entry.block(pending.context)
+        } catch (t: Throwable) {
+            error = t
+        }
+
+        var timedOut = false
+        if (attempt != null) {
+            timedOut = !attempt.done.compareAndSet(false, true) && attempt.timedOut
+            if (timedOut) Thread.interrupted() // clear the watchdog's interrupt before returning to the pool
+            taskQueue.remove(timeoutItem)     // drop the dead watchdog instead of letting it linger
+        }
+
+        when {
+            error == null -> finish(pending, result, null)
+            error is InterruptedException && !timedOut -> {
+                // Interrupted from outside (shutdownNow): never retried.
+                if (state == SchedulerState.SHUTDOWN) Thread.currentThread().interrupt()
+                finish(pending, null, error)
+            }
+            error is Error -> finish(pending, null, error)
+            else -> {
+                val effective =
+                    if (timedOut) TaskTimeoutException(entry.name, timeout!!, error) else error
+                scheduleRetryOrFinish(pending, effective)
+            }
+        }
+    }
+
+    private fun scheduleRetryOrFinish(pending: PendingExecution, error: Throwable) {
+        val entry = pending.entry
+        pending.failedAttempts++
+        val policy = entry.retryPolicy
+        if (policy == null || pending.failedAttempts >= policy.maxAttempts) {
+            finish(pending, null, error)
+            return
+        }
+        pending.lastError = error
+        val delayMs = policy.delayForFailedAttempts(pending.failedAttempts - 1)
+        val retryEvent = TaskRetryEvent(
+            taskName = entry.name,
+            failedAttempts = pending.failedAttempts,
+            maxAttempts = policy.maxAttempts,
+            error = error,
+            nextRetryDelayMs = delayMs
+        )
+        fireHooks(entry.name, SchedulerErrorPhase.ON_RETRY, retryEvent, entry.hooks.onRetry, config.onRetry)
+
+        // Retries wait in the delay queue instead of sleeping on this worker thread.
+        val item = QueueItem.Retry(pending, System.currentTimeMillis() + delayMs)
+        taskQueue.offer(item)
+        // If shutdown raced with the offer, reclaim the item and settle now.
+        if (state == SchedulerState.SHUTDOWN && taskQueue.remove(item)) {
+            finish(pending, null, error)
+        }
+    }
+
+    private fun fireTimeout(attempt: Attempt) {
+        attempt.timedOut = true
+        if (attempt.done.compareAndSet(false, true)) {
+            attempt.thread.interrupt()
+        }
+    }
+
+    private fun finish(pending: PendingExecution, result: Any?, error: Throwable?) {
+        if (!pending.finished.compareAndSet(false, true)) return
+        livePendings.remove(pending)
+        val entry = pending.entry
+        if (pending.started) {
+            entry.endExecution()
+            val event = TaskCompleteEvent(entry.name, pending.startedAt, System.currentTimeMillis(), result, error)
+            entry.stats.markCompleted(event)
+            fireHooks(entry.name, SchedulerErrorPhase.ON_TASK_COMPLETE, event, entry.hooks.onComplete, config.onTaskComplete)
+            if (error != null && entry.hooks.onComplete == null && config.onTaskComplete == null) {
+                logger.log(Level.WARNING, "Task '${entry.name}' failed", error)
+            }
+        }
+        pending.future.complete(
+            if (error == null) TaskRunResult.Success(result) else TaskRunResult.Failure(error)
+        )
+    }
+
+    /** Settles an execution that never ran (skipped or rejected) with an explicit outcome. */
+    private fun settle(pending: PendingExecution, outcome: TaskRunResult) {
+        if (!pending.finished.compareAndSet(false, true)) return
+        livePendings.remove(pending)
+        pending.future.complete(outcome)
+    }
+
+    /** Settles retries still waiting in the queue when the scheduler shuts down. */
+    private fun failPendingRetries() {
+        for (item in taskQueue.toList()) {
+            if (taskQueue.remove(item) && item is QueueItem.Retry) {
+                val pending = item.pending
+                finish(pending, null, pending.lastError ?: InterruptedException("Scheduler shut down"))
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Events
+    // ------------------------------------------------------------------------
+
+    private fun recordSkip(entry: TaskEntry, scheduledTime: Long?, type: TaskExecutionType) {
+        val event = TaskSkippedEvent(
+            taskName = entry.name,
+            scheduledTime = scheduledTime,
+            skippedAt = System.currentTimeMillis(),
+            executionType = type,
+            reason = TaskSkipReason.ALREADY_RUNNING
+        )
+        entry.stats.skipCount.incrementAndGet()
+        fireHooks(entry.name, SchedulerErrorPhase.ON_TASK_SKIPPED, event, entry.hooks.onSkipped, config.onTaskSkipped)
+    }
+
+    private fun recordRejected(entry: TaskEntry, scheduledTime: Long?, type: TaskExecutionType) {
+        val event = TaskRejectedEvent(
+            taskName = entry.name,
+            scheduledTime = scheduledTime,
+            rejectedAt = System.currentTimeMillis(),
+            executionType = type,
+            reason = TaskRejectedReason.WORKER_QUEUE_FULL
+        )
+        entry.stats.rejectedCount.incrementAndGet()
+        fireHooks(entry.name, SchedulerErrorPhase.ON_TASK_REJECTED, event, entry.hooks.onRejected, config.onTaskRejected)
     }
 
     private fun ensureAcceptsConfiguration() {
@@ -375,50 +576,85 @@ class TaskScheduler private constructor(
         }
     }
 
+    /** Fires the task-level hook then the global hook, isolating failures of each. */
+    private fun <T> fireHooks(
+        taskName: String,
+        phase: SchedulerErrorPhase,
+        event: T,
+        taskHook: ((T) -> Unit)?,
+        globalHook: ((T) -> Unit)?
+    ) {
+        safeHook(taskName, phase) { taskHook?.invoke(event) }
+        safeHook(taskName, phase) { globalHook?.invoke(event) }
+    }
+
     private fun reportSchedulerError(taskName: String?, phase: SchedulerErrorPhase, error: Throwable) {
-        val event = SchedulerErrorEvent(taskName, phase, error)
+        val handler = config.onSchedulerError
+        if (handler == null) {
+            logger.log(Level.ERROR, "Scheduler error in phase $phase (task: $taskName)", error)
+            return
+        }
         try {
-            config.onSchedulerError?.invoke(event)
+            handler(SchedulerErrorEvent(taskName, phase, error))
         } catch (secondary: Throwable) {
             secondary.addSuppressed(error)
-            secondary.printStackTrace()
+            logger.log(Level.ERROR, "onSchedulerError hook threw", secondary)
         }
     }
 
-    private fun TaskEntry.toTaskInfo(): TaskInfo {
-        val stats = stats
-        return TaskInfo(
-            name = name,
-            scheduleDescription = schedule?.describe(),
-            enabled = enabled.get(),
-            allowConcurrent = allowConcurrent,
-            retryPolicy = retryPolicy,
-            activeExecutions = stats.activeExecutions.get(),
-            running = stats.activeExecutions.get() > 0,
-            nextScheduledAt = stats.nextScheduledAt,
-            lastStartedAt = stats.lastStartedAt,
-            lastCompletedAt = stats.lastCompletedAt,
-            lastDurationMs = stats.lastDurationMs,
-            lastError = stats.lastError,
-            runCount = stats.runCount.get(),
-            successCount = stats.successCount.get(),
-            failureCount = stats.failureCount.get(),
-            skipCount = stats.skipCount.get(),
-            rejectedCount = stats.rejectedCount.get()
-        )
+    private fun TaskEntry.toTaskInfo(): TaskInfo = TaskInfo(
+        name = name,
+        scheduleDescription = describeSchedule(),
+        enabled = enabled.get(),
+        allowConcurrent = allowConcurrent,
+        retryPolicy = retryPolicy,
+        timeout = timeout,
+        tags = tags,
+        activeExecutions = stats.activeExecutions.get(),
+        running = stats.activeExecutions.get() > 0,
+        nextScheduledAt = stats.nextScheduledAt,
+        lastStartedAt = stats.lastStartedAt,
+        lastCompletedAt = stats.lastCompletedAt,
+        lastDurationMs = stats.lastDurationMs,
+        lastError = stats.lastError,
+        runCount = stats.runCount.get(),
+        successCount = stats.successCount.get(),
+        failureCount = stats.failureCount.get(),
+        skipCount = stats.skipCount.get(),
+        rejectedCount = stats.rejectedCount.get()
+    )
+
+    private fun TaskEntry.describeSchedule(): String? {
+        val base = schedule?.describe() ?: return null
+        val delay = initialDelay ?: return base
+        return "initial-delay ${delay.toMillisDescription()}, then $base"
     }
 
-    private data class TaskEntry(
+    // ------------------------------------------------------------------------
+    // Internal state holders
+    // ------------------------------------------------------------------------
+
+    private class TaskEntry(
         val name: String,
         val schedule: Schedule?,
+        val initialDelay: Duration?,
         val trigger: Trigger?,
         val allowConcurrent: Boolean,
         val retryPolicy: RetryPolicy?,
+        val timeout: Duration?,
+        val tags: Set<String>,
+        val hooks: TaskHooks,
         val enabled: AtomicBoolean,
-        val executing: AtomicBoolean,
         val stats: TaskStats,
         val block: TaskContext.() -> Any?
     ) {
+        val executing = AtomicBoolean(false)
+
+        /** The single live scheduled fire for this entry, or null when none is armed. */
+        val currentFire = AtomicReference<QueueItem.Fire?>(null)
+
+        val rearmAfterCompletion: Boolean get() = schedule is Schedule.FixedDelay
+
         fun beginExecution(): Boolean {
             if (!allowConcurrent && !executing.compareAndSet(false, true)) return false
             stats.activeExecutions.incrementAndGet()
@@ -457,7 +693,6 @@ class TaskScheduler private constructor(
         fun markStarted(at: Long) {
             runCount.incrementAndGet()
             lastStartedAt = at
-            lastError = null
         }
 
         fun markCompleted(event: TaskCompleteEvent) {
@@ -473,14 +708,49 @@ class TaskScheduler private constructor(
         }
     }
 
-    private class ScheduledTask(
-        val taskName: String,
-        val scheduledTime: Long
-    ) : Delayed {
+    /**
+     * One execution spanning all of its retry attempts. Fields are volatile because
+     * consecutive attempts may run on different worker threads.
+     */
+    private class PendingExecution(
+        val entry: TaskEntry,
+        val scheduledTime: Long?,
+        val type: TaskExecutionType,
+        val context: TaskContextImpl,
+        val future: CompletableFuture<TaskRunResult>
+    ) {
+        @Volatile
+        var started = false
+
+        @Volatile
+        var startedAt = 0L
+
+        @Volatile
+        var failedAttempts = 0
+
+        @Volatile
+        var lastError: Throwable? = null
+
+        val finished = AtomicBoolean(false)
+    }
+
+    /** Timeout token for a single attempt; whoever wins [done] owns the outcome. */
+    private class Attempt(val thread: Thread) {
+        val done = AtomicBoolean(false)
+
+        @Volatile
+        var timedOut = false
+    }
+
+    private sealed class QueueItem(val time: Long) : Delayed {
+        class Fire(val entry: TaskEntry, time: Long) : QueueItem(time)
+        class Retry(val pending: PendingExecution, time: Long) : QueueItem(time)
+        class Timeout(val attempt: Attempt, time: Long) : QueueItem(time)
+
         override fun getDelay(unit: TimeUnit): Long =
-            unit.convert(scheduledTime - System.currentTimeMillis(), TimeUnit.MILLISECONDS)
+            unit.convert(time - System.currentTimeMillis(), TimeUnit.MILLISECONDS)
 
         override fun compareTo(other: Delayed): Int =
-            scheduledTime.compareTo((other as ScheduledTask).scheduledTime)
+            time.compareTo((other as QueueItem).time)
     }
 }

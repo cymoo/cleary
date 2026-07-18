@@ -558,9 +558,9 @@ class TaskDashboard(
     private fun RetryPolicy.toSnapshot(): RetryPolicySnapshot =
         RetryPolicySnapshot(
             maxAttempts = maxAttempts,
-            initialDelayMs = initialDelay.toMillis(),
+            initialDelayMs = initialDelay.inWholeMilliseconds,
             backoffMultiplier = backoffMultiplier,
-            maxDelayMs = maxDelay.toMillis()
+            maxDelayMs = maxDelay.inWholeMilliseconds
         )
 
     private fun currentScheduler(): TaskScheduler =

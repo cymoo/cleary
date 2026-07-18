@@ -105,6 +105,13 @@ class TaskSchedulerTest {
         }
 
         @Test
+        @DisplayName("taskScheduler() top-level factory builds a scheduler")
+        fun topLevelFactory() {
+            tm = taskScheduler { autoStart = true }
+            assertTrue(tm.isRunning)
+        }
+
+        @Test
         @DisplayName("calling start() twice is a no-op")
         fun startIdempotent() {
             tm = TaskScheduler()
@@ -221,10 +228,10 @@ class TaskSchedulerTest {
         }
 
         @Test
-        @DisplayName("missing run block throws IllegalStateException")
+        @DisplayName("missing run block throws IllegalArgumentException")
         fun missingRunBlockThrows() {
             tm = scheduler()
-            assertThrows<IllegalStateException> {
+            assertThrows<IllegalArgumentException> {
                 tm.task("bad") { every(Duration.ofSeconds(1)) }
             }
         }
@@ -378,7 +385,7 @@ class TaskSchedulerTest {
             tm = scheduler()
             val captured = AtomicReference<String>()
             tm.task("t") {
-                run { captured.set(getOrNull("key")) }
+                run { captured.set(getAs("key")) }
             }
             tm.runBlocking("t", mapOf("key" to "hello"))
             assertEquals("hello", captured.get())
@@ -410,7 +417,7 @@ class TaskSchedulerTest {
                 context["env"] = "test"
             }
             tm.task("t") {
-                run { captured.set(getOrNull("env")) }
+                run { captured.set(getAs("env")) }
             }
             tm.runBlocking("t")
             assertEquals("test", captured.get())
@@ -423,7 +430,7 @@ class TaskSchedulerTest {
             tm.task("t") {
                 run {
                     this["temp"] = "value"
-                    getOrNull<String>("temp")
+                    getAs<String>("temp")
                 }
             }
             // Two independent executions should not share state
@@ -466,7 +473,7 @@ class TaskSchedulerTest {
         }
 
         @Test
-        @DisplayName("initialDelay defers the first execution")
+        @DisplayName("initialDelay replaces the first interval wait")
         fun initialDelayDefers() {
             tm = scheduler()
             val firstRunAt = AtomicReference<Long>()
@@ -474,7 +481,7 @@ class TaskSchedulerTest {
             val startedAt = System.currentTimeMillis()
 
             tm.task("t") {
-                every(Duration.ofMillis(50))
+                every(Duration.ofSeconds(5))
                 initialDelay(Duration.ofMillis(200))
                 run {
                     if (firstRunAt.compareAndSet(null, System.currentTimeMillis())) {
@@ -482,9 +489,23 @@ class TaskSchedulerTest {
                     }
                 }
             }
+            // First run at ~200 ms — waiting interval + delay (5.2 s) would time out here.
             awaitLatch(latch, 2_000)
             val elapsed = firstRunAt.get()!! - startedAt
             assertTrue(elapsed >= 180) { "Expected ≥ 180 ms initial delay, got $elapsed ms" }
+        }
+
+        @Test
+        @DisplayName("initialDelay(0) fires the first run immediately")
+        fun zeroInitialDelayFiresImmediately() {
+            tm = scheduler()
+            val latch = CountDownLatch(1)
+            tm.task("t") {
+                every(Duration.ofSeconds(5))
+                initialDelay(Duration.ZERO)
+                run { latch.countDown() }
+            }
+            awaitLatch(latch, 2_000)
         }
 
         @Test
@@ -1208,7 +1229,7 @@ class TaskSchedulerTest {
                 autoStart = true
                 onTaskStart = { event -> event.context["traceId"] = "trace-123" }
             }
-            tm.task("t") { run { captured.set(getOrNull("traceId")) } }
+            tm.task("t") { run { captured.set(getAs("traceId")) } }
             tm.runBlocking("t")
             assertEquals("trace-123", captured.get())
         }
@@ -1282,47 +1303,58 @@ class TaskSchedulerTest {
     inner class Triggers {
 
         @Test
-        @DisplayName("FixedRateTrigger advances by interval each call")
+        @DisplayName("FixedRateTrigger first fires after initialDelay, or one interval without it")
+        fun fixedRateTriggerInitial() {
+            assertEquals(1_100L, FixedRateTrigger(100, null).initialExecutionTime(1_000L))
+            assertEquals(1_030L, FixedRateTrigger(100, 30).initialExecutionTime(1_000L))
+        }
+
+        @Test
+        @DisplayName("FixedRateTrigger advances by interval and skips missed slots on the grid")
         fun fixedRateTriggerAdvances() {
-            val trigger = FixedRateTrigger(Duration.ofMillis(100))
-            val t0 = 1_000L
-            assertEquals(1_100L, trigger.nextExecutionTime(t0))
-            assertEquals(1_200L, trigger.nextExecutionTime(1_100L))
+            val trigger = FixedRateTrigger(100, null)
+            // on time (or catch-up mode): next grid slot
+            assertEquals(1_100L, trigger.nextExecutionTime(1_000L, 1_000L))
+            // 2.5 intervals late: jump to the next future slot, staying on the grid
+            assertEquals(1_300L, trigger.nextExecutionTime(1_000L, 1_250L))
+            // exactly on a slot boundary: result must be strictly after minTime
+            assertEquals(1_300L, trigger.nextExecutionTime(1_000L, 1_200L))
         }
 
         @Test
-        @DisplayName("OnceTrigger returns time on first call and null thereafter")
+        @DisplayName("FixedDelayTrigger schedules relative to the previous completion")
+        fun fixedDelayTrigger() {
+            val trigger = FixedDelayTrigger(100, null)
+            assertEquals(1_100L, trigger.initialExecutionTime(1_000L))
+            assertEquals(2_100L, trigger.nextExecutionTime(2_000L, 2_000L))
+        }
+
+        @Test
+        @DisplayName("OnceTrigger re-arms until it fires, then never again")
         fun onceTriggerFiresOnce() {
-            val at = Instant.ofEpochMilli(5_000L)
-            val trigger = OnceTrigger(at)
-            assertEquals(5_000L, trigger.nextExecutionTime(0L))
-            assertNull(trigger.nextExecutionTime(0L))
-            assertNull(trigger.nextExecutionTime(0L))
+            val trigger = OnceTrigger(5_000L)
+            assertEquals(5_000L, trigger.initialExecutionTime(0L))
+            // re-arming before the fire (disable/enable) keeps the original time
+            assertEquals(5_000L, trigger.initialExecutionTime(0L))
+            // dispatching the fire consumes the trigger
+            assertNull(trigger.nextExecutionTime(5_000L, 5_000L))
+            assertNull(trigger.initialExecutionTime(0L))
         }
 
         @Test
-        @DisplayName("InitialDelayTrigger shifts first execution and delegates thereafter")
-        fun initialDelayTriggerShiftsOnce() {
-            val inner = FixedRateTrigger(Duration.ofMillis(100))
-            val trigger = InitialDelayTrigger(Duration.ofMillis(200), inner)
-            val t0 = 1_000L
-            // First call: inner gives 1100, then +200 delay = 1300
-            assertEquals(1_300L, trigger.nextExecutionTime(t0))
-            // Subsequent calls: delegate directly to inner (no more delay)
-            assertEquals(1_400L, trigger.nextExecutionTime(1_300L))
-            assertEquals(1_500L, trigger.nextExecutionTime(1_400L))
+        @DisplayName("DelayedTrigger shifts the arm time for custom triggers")
+        fun delayedTriggerShiftsArmTime() {
+            val trigger = DelayedTrigger(200, FixedRateTrigger(100, null))
+            assertEquals(1_300L, trigger.initialExecutionTime(1_000L))
+            assertEquals(1_400L, trigger.nextExecutionTime(1_300L, 1_300L))
         }
 
         @Test
-        @DisplayName("InitialDelayTrigger with OnceTrigger fires once at delayed time")
-        fun initialDelayWithOnceTrigger() {
-            val at = Instant.ofEpochMilli(1_000L)
-            val inner = OnceTrigger(at)
-            val trigger = InitialDelayTrigger(Duration.ofMillis(500), inner)
-            // First call returns once-time + delay
-            assertEquals(1_500L, trigger.nextExecutionTime(0L))
-            // Second call: inner already fired, returns null
-            assertNull(trigger.nextExecutionTime(1_500L))
+        @DisplayName("trigger time math saturates instead of overflowing")
+        fun triggerMathSaturates() {
+            val huge = FixedRateTrigger(Long.MAX_VALUE / 2, null)
+            assertTrue(huge.initialExecutionTime(Long.MAX_VALUE / 2 + 10) > 0)
+            assertEquals(Long.MAX_VALUE, huge.nextExecutionTime(Long.MAX_VALUE - 10, Long.MAX_VALUE - 5))
         }
 
         @Test
@@ -1334,12 +1366,16 @@ class TaskSchedulerTest {
         }
 
         @Test
-        @DisplayName("CronTrigger returns a future time for a valid expression")
+        @DisplayName("CronTrigger returns future times for a valid expression")
         fun cronTriggerReturnsFutureTime() {
             val trigger = CronTrigger("0/1 * * * * ?", ZoneId.systemDefault())
-            val next = trigger.nextExecutionTime(System.currentTimeMillis())
+            val now = System.currentTimeMillis()
+            val first = trigger.initialExecutionTime(now)
+            assertNotNull(first)
+            assertTrue(first!! >= now)
+            val next = trigger.nextExecutionTime(first, first)
             assertNotNull(next)
-            assertTrue(next!! > System.currentTimeMillis() - 1_100)
+            assertTrue(next!! > first)
         }
     }
 
@@ -1446,11 +1482,24 @@ class TaskSchedulerTest {
         }
 
         @Test
-        @DisplayName("WithInitialDelay wraps inner description")
-        fun withInitialDelayDescription() {
-            val inner = Schedule.FixedRate(Duration.ofSeconds(10))
-            val s = Schedule.WithInitialDelay(Duration.ofSeconds(5), inner).describe()
-            assertTrue(s.contains("initial-delay") && s.contains("10s"))
+        @DisplayName("FixedDelay describes its interval")
+        fun fixedDelayDescription() {
+            assertEquals("fixed-delay 10s", Schedule.FixedDelay(Duration.ofSeconds(10)).describe())
+        }
+
+        @Test
+        @DisplayName("initial delay is included in the task's schedule description")
+        fun initialDelayDescription() {
+            tm = scheduler()
+            tm.task("t") {
+                every(Duration.ofSeconds(10))
+                initialDelay(Duration.ofSeconds(5))
+                run { }
+            }
+            val description = tm.getTaskInfo("t")!!.scheduleDescription!!
+            assertTrue(description.contains("initial-delay 5s") && description.contains("every 10s")) {
+                description
+            }
         }
     }
 
@@ -1594,37 +1643,59 @@ class TaskSchedulerTest {
         }
 
         @Test
-        @DisplayName("context key not found throws NoSuchElementException")
+        @DisplayName("context require throws NoSuchElementException for missing key")
         fun contextKeyNotFoundThrows() {
             tm = scheduler()
             tm.task("t") {
                 run {
                     assertThrows<NoSuchElementException> {
-                        this.get<String>("nonexistent")
+                        require<String>("nonexistent")
                     }
                 }
             }
-            tm.runBlocking("t")
+            assertSuccess(tm.runBlocking("t"))
         }
 
         @Test
-        @DisplayName("context getOrNull returns null for missing key")
-        fun contextGetOrNullReturnsNull() {
+        @DisplayName("context require throws ClassCastException for a wrong type")
+        fun contextRequireWrongType() {
             tm = scheduler()
             tm.task("t") {
-                run { assertNull(getOrNull<String>("missing")) }
+                run {
+                    this["num"] = 42
+                    assertThrows<ClassCastException> { require<String>("num") }
+                }
             }
-            tm.runBlocking("t")
+            assertSuccess(tm.runBlocking("t"))
         }
 
         @Test
-        @DisplayName("context getOrDefault returns default for missing key")
+        @DisplayName("context getAs returns null for a missing key or wrong type")
+        fun contextGetAsChecksTypes() {
+            tm = scheduler()
+            tm.task("t") {
+                run {
+                    assertNull(getAs<String>("missing"))
+                    this["num"] = 42
+                    assertNull(getAs<String>("num"))
+                    assertEquals(42, getAs<Int>("num"))
+                }
+            }
+            assertSuccess(tm.runBlocking("t"))
+        }
+
+        @Test
+        @DisplayName("context getOrDefault returns default for missing key or wrong type")
         fun contextGetOrDefault() {
             tm = scheduler()
             tm.task("t") {
-                run { assertEquals("fallback", getOrDefault("missing", "fallback")) }
+                run {
+                    assertEquals("fallback", getOrDefault("missing", "fallback"))
+                    this["num"] = 42
+                    assertEquals("fallback", getOrDefault("num", "fallback"))
+                }
             }
-            tm.runBlocking("t")
+            assertSuccess(tm.runBlocking("t"))
         }
 
         @Test
@@ -1635,10 +1706,10 @@ class TaskSchedulerTest {
                 run {
                     this["k"] = "v"
                     this.remove("k")
-                    assertNull(getOrNull<String>("k"))
+                    assertNull(getAs<String>("k"))
                 }
             }
-            tm.runBlocking("t")
+            assertSuccess(tm.runBlocking("t"))
         }
     }
 
@@ -1652,128 +1723,392 @@ class TaskSchedulerTest {
         }
     }
 
+    // =========================================================================
+    // 17. Scheduling — FixedDelay
+    // =========================================================================
+
     @Nested
-    inner class DurationExtensionsTest {
-        // ---------- Milliseconds ----------
+    @DisplayName("Scheduling — FixedDelay")
+    inner class FixedDelayScheduling {
 
         @Test
-        fun `Int milliseconds`() {
-            assertEquals(Duration.ofMillis(500), 500.milliseconds)
-            assertEquals(Duration.ofMillis(500), 500.millisecond)
+        @DisplayName("interval is measured from the previous completion")
+        fun intervalFromCompletion() {
+            tm = scheduler()
+            val starts = CopyOnWriteArrayList<Long>()
+            val latch = CountDownLatch(3)
+            tm.task("t") {
+                fixedDelay(Duration.ofMillis(100))
+                run {
+                    starts.add(System.currentTimeMillis())
+                    Thread.sleep(120)
+                    latch.countDown()
+                }
+            }
+            awaitLatch(latch, 5_000)
+            // each start must wait for the previous run (~120 ms) plus the delay (100 ms)
+            for (i in 1 until minOf(3, starts.size)) {
+                val gap = starts[i] - starts[i - 1]
+                assertTrue(gap >= 200) { "Expected gap ≥ 200 ms between runs, got $gap ms" }
+            }
         }
 
         @Test
-        fun `Long milliseconds`() {
-            assertEquals(Duration.ofMillis(500), 500L.milliseconds)
-            assertEquals(Duration.ofMillis(500), 500L.millisecond)
+        @DisplayName("FixedDelay interval must be positive")
+        fun intervalMustBePositive() {
+            assertThrows<IllegalArgumentException> { Schedule.FixedDelay(Duration.ZERO) }
         }
 
         @Test
-        fun `Double milliseconds`() {
-            assertEquals(Duration.ofMillis(500), 500.0.milliseconds)
-            assertEquals(Duration.ofMillis(250), 250.0.milliseconds)
-            // 500.5ms: allow ±1µs tolerance due to Double precision limits
-            val nanos = 500.5.milliseconds.toNanos()
-            assertTrue(kotlin.math.abs(nanos - 500_500_000L) <= 1_000L)
+        @DisplayName("re-enabling a fixed-delay task resumes the stream")
+        fun reenableResumesFixedDelay() {
+            tm = scheduler()
+            val latch = CountDownLatch(1)
+            tm.task("t") {
+                fixedDelay(Duration.ofMillis(50))
+                run { latch.countDown() }
+            }
+            tm.disable("t")
+            tm.enable("t")
+            awaitLatch(latch, 2_000)
         }
+    }
 
-        // ---------- Seconds ----------
+    // =========================================================================
+    // 18. Timeout
+    // =========================================================================
+
+    @Nested
+    @DisplayName("Timeout")
+    inner class Timeout {
 
         @Test
-        fun `Int seconds`() {
-            assertEquals(Duration.ofSeconds(30), 30.seconds)
-            assertEquals(Duration.ofSeconds(30), 30.second)
-        }
-
-        @Test
-        fun `Long seconds`() {
-            assertEquals(Duration.ofSeconds(30), 30L.seconds)
-            assertEquals(Duration.ofSeconds(30), 30L.second)
-        }
-
-        @Test
-        fun `Double seconds`() {
-            assertEquals(Duration.ofSeconds(1), 1.0.seconds)
-            assertEquals(Duration.ofMillis(1500), 1.5.seconds)
-            assertEquals(Duration.ofSeconds(1, 100_000_000), 1.1.seconds)
-        }
-
-        // ---------- Minutes ----------
-
-        @Test
-        fun `Int minutes`() {
-            assertEquals(Duration.ofMinutes(5), 5.minutes)
-            assertEquals(Duration.ofMinutes(5), 5.minute)
-        }
-
-        @Test
-        fun `Long minutes`() {
-            assertEquals(Duration.ofMinutes(5), 5L.minutes)
-            assertEquals(Duration.ofMinutes(5), 5L.minute)
+        @DisplayName("attempt exceeding timeout fails with TaskTimeoutException")
+        fun timeoutInterruptsAttempt() {
+            tm = scheduler()
+            tm.task("slow") {
+                timeout(Duration.ofMillis(100))
+                run { Thread.sleep(10_000); "never" }
+            }
+            val start = System.currentTimeMillis()
+            val result = tm.runBlocking("slow")
+            val elapsed = System.currentTimeMillis() - start
+            assertTrue(result is TaskRunResult.Failure) { "Expected Failure but got $result" }
+            assertTrue((result as TaskRunResult.Failure).error is TaskTimeoutException) {
+                "Expected TaskTimeoutException but got ${result.error}"
+            }
+            assertTrue(elapsed < 5_000) { "Timeout should abort long before 10 s (took $elapsed ms)" }
         }
 
         @Test
-        fun `Double minutes`() {
-            assertEquals(Duration.ofMinutes(1), 1.0.minutes)
-            assertEquals(Duration.ofSeconds(90), 1.5.minutes)
-        }
-
-        // ---------- Hours ----------
-
-        @Test
-        fun `Int hours`() {
-            assertEquals(Duration.ofHours(2), 2.hours)
-            assertEquals(Duration.ofHours(2), 2.hour)
+        @DisplayName("fast tasks are unaffected by timeout")
+        fun fastTaskUnaffected() {
+            tm = scheduler()
+            tm.task("fast") {
+                timeout(Duration.ofSeconds(5))
+                run { "ok" }
+            }
+            assertSuccessValue("ok", tm.runBlocking("fast"))
         }
 
         @Test
-        fun `Long hours`() {
-            assertEquals(Duration.ofHours(2), 2L.hours)
-            assertEquals(Duration.ofHours(2), 2L.hour)
+        @DisplayName("infinite timeout never fires (deadline math saturates)")
+        fun infiniteTimeoutNeverFires() {
+            tm = scheduler()
+            tm.task("t") {
+                timeout(kotlin.time.Duration.INFINITE)
+                run {
+                    Thread.sleep(50)
+                    "ok"
+                }
+            }
+            assertSuccessValue("ok", tm.runBlocking("t"))
         }
 
         @Test
-        fun `Double hours`() {
-            assertEquals(Duration.ofHours(1), 1.0.hours)
-            assertEquals(Duration.ofMinutes(90), 1.5.hours)
-        }
-
-        // ---------- Days ----------
-
-        @Test
-        fun `Int days`() {
-            assertEquals(Duration.ofDays(7), 7.days)
-            assertEquals(Duration.ofDays(7), 7.day)
-        }
-
-        @Test
-        fun `Long days`() {
-            assertEquals(Duration.ofDays(7), 7L.days)
-            assertEquals(Duration.ofDays(7), 7L.day)
+        @DisplayName("timed-out attempts are retried per the retry policy")
+        fun timeoutIsRetried() {
+            tm = scheduler()
+            val attempts = AtomicInteger(0)
+            tm.task("flaky-slow") {
+                timeout(Duration.ofMillis(100))
+                retry(maxAttempts = 2, initialDelay = Duration.ofMillis(10))
+                run {
+                    if (attempts.incrementAndGet() == 1) Thread.sleep(10_000)
+                    "recovered"
+                }
+            }
+            assertSuccessValue("recovered", tm.runBlocking("flaky-slow"))
+            assertEquals(2, attempts.get())
         }
 
         @Test
-        fun `Double days`() {
-            assertEquals(Duration.ofDays(1), 1.0.days)
-            assertEquals(Duration.ofHours(36), 1.5.days)
+        @DisplayName("isCancelled lets non-blocking tasks cooperate with timeouts")
+        fun isCancelledReflectsTimeout() {
+            tm = scheduler()
+            tm.task("coop") {
+                timeout(Duration.ofMillis(100))
+                run {
+                    val deadline = System.currentTimeMillis() + 10_000
+                    while (!isCancelled && System.currentTimeMillis() < deadline) {
+                        // busy-wait: cooperative loop that never blocks
+                    }
+                    isCancelled
+                }
+            }
+            val start = System.currentTimeMillis()
+            val result = tm.runBlocking("coop")
+            // the body observed cancellation and returned normally → Success(true)
+            assertSuccessValue(true, result)
+            assertTrue(System.currentTimeMillis() - start < 5_000)
         }
+    }
 
-        // ---------- Negative values ----------
+    // =========================================================================
+    // 19. Retry — threading & interrupts
+    // =========================================================================
+
+    @Nested
+    @DisplayName("Retry — threading & interrupts")
+    inner class RetryThreading {
 
         @Test
-        fun `negative Double seconds floor correctly`() {
-            // -0.3.seconds should be ofSeconds(-1, 700_000_000), not ofSeconds(0, -300_000_000)
-            assertEquals(Duration.ofSeconds(-1, 700_000_000L), (-0.3).seconds)
-            assertEquals(Duration.ofSeconds(-2, 500_000_000L), (-1.5).seconds)
+        @DisplayName("InterruptedException from the task body is never retried")
+        fun interruptedExceptionNotRetried() {
+            val retryCount = AtomicInteger(0)
+            tm = scheduler { onRetry = { retryCount.incrementAndGet() } }
+            val attempts = AtomicInteger(0)
+            tm.task("t") {
+                retry(maxAttempts = 3, initialDelay = Duration.ofMillis(10))
+                run {
+                    attempts.incrementAndGet()
+                    throw InterruptedException("stop")
+                }
+            }
+            val result = tm.runBlocking("t")
+            assertTrue(result is TaskRunResult.Failure) { "Expected Failure but got $result" }
+            assertTrue((result as TaskRunResult.Failure).error is InterruptedException)
+            assertEquals(1, attempts.get())
+            assertEquals(0, retryCount.get())
         }
 
-        // ---------- Arithmetic sanity ----------
+        @Test
+        @DisplayName("retry waits do not occupy worker threads")
+        fun retryDoesNotOccupyWorker() {
+            tm = scheduler(concurrency = 1)   // single worker
+            val otherRan = CountDownLatch(1)
+            tm.task("failing") {
+                retry(maxAttempts = 2, initialDelay = Duration.ofMillis(500))
+                run { error("fail") }
+            }
+            tm.task("other") { run { otherRan.countDown() } }
+
+            val failing = tm.run("failing")
+            Thread.sleep(100)   // first attempt fails; the retry now waits in the delay queue
+            tm.run("other")
+            // if the retry slept on the single worker, this would block for ~500 ms
+            awaitLatch(otherRan, 400)
+            assertFailureMessage("fail", failing.get())
+        }
 
         @Test
-        fun `durations can be composed`() {
-            assertEquals(Duration.ofSeconds(90), 1.minutes + 30.seconds)
-            assertEquals(Duration.ofMillis(1500), 1.seconds + 500.milliseconds)
-            assertEquals(Duration.ofHours(25), 1.days + 1.hours)
+        @DisplayName("shutdown settles executions waiting on retries")
+        fun shutdownSettlesPendingRetries() {
+            tm = scheduler()
+            tm.task("t") {
+                retry(maxAttempts = 3, initialDelay = Duration.ofSeconds(30))
+                run { error("boom") }
+            }
+            val future = tm.run("t")
+            Thread.sleep(200)   // let the first attempt fail and enqueue its retry
+            tm.shutdown()
+            val result = future.get(2, TimeUnit.SECONDS)
+            assertTrue(result is TaskRunResult.Failure) { "Expected Failure but got $result" }
+            assertEquals("boom", (result as TaskRunResult.Failure).error.message)
+        }
+    }
+
+    // =========================================================================
+    // 20. Replace
+    // =========================================================================
+
+    @Nested
+    @DisplayName("Replace")
+    inner class Replace {
+
+        @Test
+        @DisplayName("replace() swaps schedule and body while preserving stats")
+        fun replaceSwapsDefinition() {
+            tm = scheduler()
+            val oldRuns = AtomicInteger(0)
+            tm.task("job") {
+                every(Duration.ofHours(1))
+                run { oldRuns.incrementAndGet() }
+            }
+            repeat(2) { assertSuccess(tm.runBlocking("job")) }
+            assertEquals(2, tm.getTaskInfo("job")!!.runCount)
+
+            val newRan = CountDownLatch(1)
+            tm.replace("job") {
+                every(Duration.ofMillis(50))
+                run { newRan.countDown() }
+            }
+            awaitLatch(newRan, 2_000)
+            assertEquals(2, oldRuns.get()) { "Old body must not run after replace()" }
+            assertTrue(tm.getTaskInfo("job")!!.runCount >= 3) { "Stats must carry over" }
+        }
+
+        @Test
+        @DisplayName("replace() preserves the disabled state unless enabled() is set")
+        fun replaceKeepsEnabledState() {
+            tm = scheduler()
+            tm.task("job") { run { } }
+            tm.disable("job")
+
+            tm.replace("job") { run { "new" } }
+            assertFalse(tm.getTaskInfo("job")!!.enabled)
+
+            tm.replace("job") {
+                enabled(true)
+                run { "newer" }
+            }
+            assertTrue(tm.getTaskInfo("job")!!.enabled)
+        }
+
+        @Test
+        @DisplayName("replace() of unknown task throws NoSuchElementException")
+        fun replaceUnknownThrows() {
+            tm = scheduler()
+            assertThrows<NoSuchElementException> { tm.replace("ghost") { run { } } }
+        }
+    }
+
+    // =========================================================================
+    // 21. Registration options — enabled(false), tags, listTasks
+    // =========================================================================
+
+    @Nested
+    @DisplayName("Registration options")
+    inner class RegistrationOptions {
+
+        @Test
+        @DisplayName("enabled(false) registers the task disabled; enable() arms it")
+        fun registersDisabled() {
+            tm = scheduler()
+            val count = AtomicInteger(0)
+            val latch = CountDownLatch(1)
+            tm.task("t") {
+                every(Duration.ofMillis(50))
+                enabled(false)
+                run {
+                    count.incrementAndGet()
+                    latch.countDown()
+                }
+            }
+            assertFalse(tm.getTaskInfo("t")!!.enabled)
+            Thread.sleep(200)
+            assertEquals(0, count.get()) { "Disabled task must not fire" }
+            tm.enable("t")
+            awaitLatch(latch, 2_000)
+        }
+
+        @Test
+        @DisplayName("listTasks() returns snapshots and filters by tag")
+        fun listTasksAndTags() {
+            tm = scheduler()
+            tm.task("a") {
+                tags("etl", "hourly")
+                run { }
+            }
+            tm.task("b") {
+                tags("etl")
+                run { }
+            }
+            tm.task("c") { run { } }
+
+            assertEquals(3, tm.listTasks().size)
+            assertEquals(setOf("a", "b"), tm.listTasks("etl").map { it.name }.toSet())
+            assertEquals(setOf("a"), tm.listTasks("hourly").map { it.name }.toSet())
+            assertTrue(tm.listTasks("none").isEmpty())
+            assertEquals(setOf("etl", "hourly"), tm.getTaskInfo("a")!!.tags)
+        }
+    }
+
+    // =========================================================================
+    // 22. Per-task hooks
+    // =========================================================================
+
+    @Nested
+    @DisplayName("Per-task hooks")
+    inner class PerTaskHooks {
+
+        @Test
+        @DisplayName("task-level hooks fire before global hooks")
+        fun taskHooksFireBeforeGlobal() {
+            val order = CopyOnWriteArrayList<String>()
+            val done = CountDownLatch(2)
+            tm = scheduler {
+                onTaskStart = { order.add("global-start") }
+                onTaskComplete = {
+                    order.add("global-complete")
+                    done.countDown()
+                }
+            }
+            tm.task("t") {
+                onStart { order.add("task-start") }
+                onComplete {
+                    order.add("task-complete")
+                    done.countDown()
+                }
+                run { "ok" }
+            }
+            assertSuccessValue("ok", tm.runBlocking("t"))
+            awaitLatch(done)
+            assertEquals(
+                listOf("task-start", "global-start", "task-complete", "global-complete"),
+                order
+            )
+        }
+
+        @Test
+        @DisplayName("task-level onRetry fires per failed attempt")
+        fun taskLevelRetryHook() {
+            val retries = AtomicInteger(0)
+            tm = scheduler()
+            tm.task("t") {
+                retry(maxAttempts = 3, initialDelay = Duration.ofMillis(10))
+                onRetry { retries.incrementAndGet() }
+                run { error("boom") }
+            }
+            assertFailureMessage("boom", tm.runBlocking("t"))
+            assertEquals(2, retries.get())
+        }
+    }
+
+    // =========================================================================
+    // 23. Custom triggers
+    // =========================================================================
+
+    @Nested
+    @DisplayName("Custom triggers")
+    inner class CustomTriggers {
+
+        @Test
+        @DisplayName("custom trigger drives the schedule and its description")
+        fun customTriggerRuns() {
+            tm = scheduler()
+            val latch = CountDownLatch(2)
+            val everyTwentyMs = object : Trigger {
+                override fun initialExecutionTime(armTime: Long): Long = armTime + 20
+                override fun nextExecutionTime(lastScheduledTime: Long, minTime: Long): Long =
+                    minTime + 20
+            }
+            tm.task("custom") {
+                custom(everyTwentyMs, "every 20ms (custom)")
+                run { latch.countDown() }
+            }
+            awaitLatch(latch, 2_000)
+            assertEquals("every 20ms (custom)", tm.getTaskInfo("custom")!!.scheduleDescription)
         }
     }
 }

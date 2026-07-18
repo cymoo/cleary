@@ -3,12 +3,13 @@
 ## Project Overview
 
 Cleary is a lightweight JVM task scheduler library written in Kotlin. It supports cron
-expressions, fixed-rate scheduling, one-shot tasks, retry with exponential backoff, and
-concurrency control, explicit run outcomes, and runtime task inspection - all through
-a clean DSL with no annotation processing or reflection.
+expressions, fixed-rate and fixed-delay scheduling, one-shot tasks, custom triggers,
+retry with exponential backoff, per-attempt timeouts, misfire policies, concurrency
+control, explicit run outcomes, and runtime task inspection - all through a clean DSL
+with no annotation processing or reflection.
 
 - **Group ID / Artifact**: `io.github.cymoo:cleary`
-- **Current version**: `0.2.0`
+- **Current version**: `0.3.0`
 - **Minimum Java**: 11
 - **Build tool**: Maven
 
@@ -38,12 +39,12 @@ Production code is split by concern but remains in the single package
 
 | File | Key types / responsibilities |
 |---|---|
-| `TaskScheduler.kt` | public API: `task`, `start`, `shutdown`, `await`, `run`, `runBlocking`, `enable`, `disable`, `remove`, `exists`, `listTaskNames`, `getTaskInfo`; internal queue dispatch and execution accounting |
-| `TaskSchedulerConfig.kt` | configuration DSL, lifecycle/result enums, event payloads, `TaskRunResult`, `TaskInfo` |
-| `TaskBuilder.kt` | `TaskBuilder` DSL receiver and `RetryPolicy` backoff calculation |
-| `Schedule.kt` | `Schedule` sealed class, cron/fixed-rate/once/initial-delay triggers, duration extension properties |
-| `TaskContext.kt` | `TaskContext` interface and isolated per-execution implementation |
-| `examples/task-dashboard/` | runnable web UI demonstrating grouping, manual runs, enable/disable/remove/reset, counters, and history |
+| `TaskScheduler.kt` | public API: `taskScheduler`, `task`, `replace`, `start`, `shutdown`, `await`, `run`, `runBlocking`, `enable`, `disable`, `remove`, `exists`, `listTaskNames`, `listTasks`, `getTaskInfo`; internal queue dispatch (fires, retries, timeouts) and execution accounting |
+| `TaskSchedulerConfig.kt` | configuration DSL, `MisfirePolicy`, lifecycle/result enums, event payloads, `TaskRunResult`, `TaskInfo`, `TaskTimeoutException` |
+| `TaskBuilder.kt` | `TaskBuilder` DSL receiver (schedules, timeout, tags, per-task hooks) and `RetryPolicy` backoff calculation |
+| `Schedule.kt` | `Schedule` sealed class, public `Trigger` interface, cron/fixed-rate/fixed-delay/once/custom trigger implementations |
+| `TaskContext.kt` | `TaskContext` interface, reified typed accessors, copy-on-write per-execution implementation |
+| `examples/task-dashboard/` | runnable web UI demonstrating grouping, manual runs, enable/disable/remove/reset, counters, and history (still targets the 0.2.x API) |
 
 ## Build & Test Commands
 
@@ -97,21 +98,46 @@ mvn deploy -P release
 
 ## Key Design Notes
 
-- The scheduler runs on a **single dedicated thread** that drains a `DelayQueue`.
-  All task execution happens on a separate **fixed-size worker pool**.
+- The scheduler runs on a **single dedicated thread** that drains a `DelayQueue` of
+  `Fire` (scheduled runs), `Retry` (pending retry attempts), and `Timeout` (attempt
+  watchdogs) items. All task execution happens on a separate **fixed-size worker pool**.
+- **Single-stream invariant**: each task has at most one live `Fire` in the queue,
+  enforced by a CAS on `TaskEntry.currentFire`. `disable`/`remove`/`replace` kill the
+  stream by swapping that reference; stale queue items are dropped by identity checks
+  at dispatch time. Never `offer` a `Fire` without going through this CAS.
+- **Misfire policy**: under the default `SKIP`, late fires run once and the trigger
+  is asked for the next time strictly after `now` (fixed-rate stays on its grid);
+  `CATCH_UP` replays every missed slot.
 - Worker submissions use a bounded queue (`queueCapacity`). If it is full, the run is
   reported as `TaskRunResult.Rejected` for manual calls and `onTaskRejected` for all calls.
 - **Fixed-rate drift prevention**: the next trigger time is anchored to the *planned*
   scheduled time, not to `Instant.now()`, so accumulated execution latency never shifts
-  the schedule.
+  the schedule. Fixed-delay tasks instead re-arm when the execution's future completes.
 - **Concurrency guard** (`allowConcurrent = false`, default): an in-flight task whose
-  next slot arrives while it is still executing is **skipped**, not executed.
-- **Context isolation**: the `TaskContext` passed to each task block is a per-execution
-  copy of the global context — tasks cannot share mutable state through it accidentally.
-- **Retry threading**: retries sleep on the worker thread that ran the first attempt.
-  The next *scheduled* slot is re-enqueued before the first attempt begins, so retries
-  never delay future runs.
+  next slot arrives while it is still executing is **skipped**, not executed. The
+  fast-path check happens before the worker pool is involved; the worker-side CAS in
+  `beginExecution` remains the authoritative guard.
+- **Context isolation**: the `TaskContext` passed to each task block is a copy-on-write
+  view over the global context — reads fall through until the first write materializes
+  a private map, so non-writing executions allocate nothing.
+- **Retry threading**: retries wait in the scheduler's `DelayQueue`, never on a worker
+  thread. One `PendingExecution` spans all attempts and completes a single
+  `CompletableFuture`. `InterruptedException` and `Error` are never retried.
+- **No hung futures**: every unfinished `PendingExecution` is tracked in `livePendings`;
+  `shutdown()` settles queued retries early and sweeps whatever `shutdownNow` dropped,
+  so `run()`/`runBlocking()` callers can never hang across shutdown.
+- **Timeouts**: a `Timeout` watchdog item interrupts the attempt's thread; ownership
+  of the outcome is decided by a CAS on the attempt's `done` flag so a completed
+  attempt is never interrupted retroactively. Watchdog items are removed when the
+  attempt completes, each attempt starts by clearing any leaked interrupt flag, and
+  all deadline math uses `saturatedAdd` (so `Duration.INFINITE` timeouts are safe).
 - **Explicit manual outcomes**: `run()` and `runBlocking()` return `TaskRunResult`
   (`Success`, `Failure`, `Skipped`, or `Rejected`) instead of throwing task-body errors.
 - **Hook isolation**: exceptions from lifecycle hooks are reported through
-  `onSchedulerError` and must not change the task body's result.
+  `onSchedulerError` and must not change the task body's result. Per-task hooks fire
+  before their global counterparts. Hooks may run on scheduler/worker/caller threads.
+- **Default logging**: when no relevant hook is configured, failures are logged via
+  `System.Logger` (`io.github.cymoo.cleary`) — final task failures at `WARNING`,
+  scheduler errors at `ERROR`.
+- **Durations**: the public API uses `kotlin.time.Duration` with `java.time.Duration`
+  overloads on every DSL function; do not reintroduce custom duration extensions.
