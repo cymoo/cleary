@@ -48,7 +48,7 @@ control — all through a clean DSL with no annotation processing or reflection.
 implementation("io.github.cymoo:cleary:0.3.0")
 ```
 
-Cleary requires **Java 11** or later.
+Cleary requires **Java 21** or later.
 
 > **Upgrading from 0.2.x?** See [Breaking changes in 0.3.0](#breaking-changes-in-030).
 
@@ -602,20 +602,41 @@ tasks.remove("new-poller")
 
 ## Web Dashboard
 
-Cleary ships a built-in web dashboard served by the JDK's embedded HTTP server —
-no extra dependencies. It shows live scheduler state (overview counters, a
-per-task timeline of upcoming fires, and an activity feed of completions,
-failures, retries, timeouts, skips, and rejections) and supports manual runs,
-pause/resume, removal, and rescheduling from the browser with live expression
-preview. Light and dark themes included.
+Cleary ships a built-in web dashboard implemented as a
+[Colleen](https://github.com/cymoo/colleen) application. It shows live
+scheduler state (overview counters, a per-task timeline of upcoming fires, and
+an activity feed of completions, failures, retries, timeouts, skips, and
+rejections) and supports manual runs, pause/resume, removal, and rescheduling
+from the browser with live expression preview. Light and dark themes included.
+
+The colleen dependency is **optional** in cleary's POM — add it explicitly to
+use the dashboard:
+
+```xml
+<dependency>
+    <groupId>io.github.cymoo</groupId>
+    <artifactId>colleen</artifactId>
+    <version>0.5.0</version>
+</dependency>
+```
+
+**Standalone** — the dashboard runs its own server:
 
 ```kotlin
 import io.github.cymoo.cleary.dashboard.Dashboard
 
 val dashboard = Dashboard(scheduler).start(port = 8378)
-println("Dashboard at http://localhost:${dashboard.port}")
 // ... later
 dashboard.stop()
+```
+
+**Embedded** — mount it into an existing Colleen application as a sub-app:
+
+```kotlin
+val app = Colleen()
+app.get("/") { "my app" }
+app.mount("/tasks", Dashboard(scheduler).app)
+app.listen(8000)   // dashboard at http://localhost:8000/tasks/
 ```
 
 Options:
@@ -624,7 +645,7 @@ Options:
 Dashboard(scheduler) {
     eventHistoryLimit = 300   // activity feed depth
     readOnly = true           // all mutating endpoints answer 403
-}.start(port = 0)             // port 0 binds an ephemeral port; read dashboard.port
+}
 ```
 
 The schedule editor accepts `every <duration>` (`every 90s`, `every 1h30m`),
@@ -635,7 +656,8 @@ The server binds to `127.0.0.1` by default and has **no authentication** — to
 expose it beyond localhost, front it with an authenticating reverse proxy or
 enable `readOnly`.
 
-The page is driven by a small JSON API that can also be used directly:
+The page is driven by a small JSON API that can also be used directly
+(paths are relative to the mount point):
 
 | Endpoint | Description |
 |---|---|
@@ -743,6 +765,8 @@ Test dependencies: `org.junit.jupiter` (JUnit 5).
 
 ## Breaking changes in 0.3.0
 
+- **Java 21+** is now required (was 11), aligning with the Colleen-based dashboard
+  and current LTS.
 - **Durations**: the custom `5.seconds` / `1.hour` extension properties were removed.
   Use `kotlin.time.Duration` literals (`import kotlin.time.Duration.Companion.seconds`)
   or the `java.time.Duration` overloads. `RetryPolicy` and `Schedule` now carry

@@ -2,6 +2,8 @@ package io.github.cymoo.cleary
 
 import io.github.cymoo.cleary.dashboard.Dashboard
 import io.github.cymoo.cleary.dashboard.ScheduleExpr
+import io.github.cymoo.colleen.Colleen
+import io.github.cymoo.colleen.TestClient
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -205,22 +207,10 @@ class DashboardTest {
     @DisplayName("Dashboard HTTP")
     inner class Http {
 
-        private val client: HttpClient = HttpClient.newHttpClient()
+        private fun dashboard(readOnly: Boolean = false): Dashboard =
+            Dashboard(tm) { this.readOnly = readOnly }.also { dashboard = it }
 
-        private fun startDashboard(readOnly: Boolean = false): Dashboard =
-            Dashboard(tm) { this.readOnly = readOnly }.start(port = 0).also { dashboard = it }
-
-        private fun get(dash: Dashboard, path: String): HttpResponse<String> =
-            client.send(
-                HttpRequest.newBuilder(URI.create("http://127.0.0.1:${dash.port}$path")).GET().build(),
-                HttpResponse.BodyHandlers.ofString()
-            )
-
-        private fun post(dash: Dashboard, path: String, body: String? = null): HttpResponse<String> {
-            val builder = HttpRequest.newBuilder(URI.create("http://127.0.0.1:${dash.port}$path"))
-            builder.POST(HttpRequest.BodyPublishers.ofString(body ?: ""))
-            return client.send(builder.build(), HttpResponse.BodyHandlers.ofString())
-        }
+        private fun client(dash: Dashboard) = TestClient(dash.app)
 
         @Test
         @DisplayName("serves the page, stylesheet, and a state snapshot")
@@ -231,23 +221,23 @@ class DashboardTest {
                 tags("web")
                 run { "ok" }
             }
-            val dash = startDashboard()
+            val client = client(dashboard())
 
-            val page = get(dash, "/")
-            assertEquals(200, page.statusCode())
-            assertTrue(page.body().contains("cleary"))
+            val page = client.get("/").send()
+            assertEquals(200, page.status)
+            assertTrue(page.text()!!.contains("cleary"))
 
-            val css = get(dash, "/assets/styles.css")
-            assertEquals(200, css.statusCode())
-            assertTrue(css.body().contains("--accent"))
+            val css = client.get("/assets/styles.css").send()
+            assertEquals(200, css.status)
+            assertTrue(css.text()!!.contains("--accent"))
 
-            val state = get(dash, "/api/state")
-            assertEquals(200, state.statusCode())
-            val body = state.body()
+            val state = client.get("/api/state").send()
+            assertEquals(200, state.status)
+            val body = state.text()!!
             assertTrue(body.contains("\"name\":\"demo\"")) { body }
             assertTrue(body.contains("\"expr\":\"every 30s\"")) { body }
             assertTrue(body.contains("\"tags\":[\"web\"]")) { body }
-            assertTrue(body.contains("\"total_tasks\":1")) { body }
+            assertTrue(body.contains("\"totalTasks\":1")) { body }
             assertTrue(body.contains("\"upcoming\":[")) { body }
         }
 
@@ -260,27 +250,28 @@ class DashboardTest {
                 every(Duration.ofHours(1))
                 run { ran.countDown() }
             }
-            val dash = startDashboard()
+            val client = client(dashboard())
 
-            assertEquals(200, post(dash, "/api/tasks/job/run").statusCode())
+            assertEquals(200, client.post("/api/tasks/job/run").send().status)
             assertTrue(ran.await(2, TimeUnit.SECONDS))
 
-            assertEquals(200, post(dash, "/api/tasks/job/pause").statusCode())
+            assertEquals(200, client.post("/api/tasks/job/pause").send().status)
             assertFalse(tm.getTaskInfo("job")!!.enabled)
-            assertEquals(200, post(dash, "/api/tasks/job/resume").statusCode())
+            assertEquals(200, client.post("/api/tasks/job/resume").send().status)
             assertTrue(tm.getTaskInfo("job")!!.enabled)
 
-            val rescheduled = post(dash, "/api/tasks/job/schedule", "{\"expr\": \"every 45s\"}")
-            assertEquals(200, rescheduled.statusCode())
-            assertEquals("every 45s", get(dash, "/api/state").body().let {
+            val rescheduled = client.post("/api/tasks/job/schedule").json(mapOf("expr" to "every 45s")).send()
+            assertEquals(200, rescheduled.status)
+            assertEquals("every 45s", client.get("/api/state").send().text()!!.let {
                 Regex("\"expr\":\"([^\"]+)\"").find(it)?.groupValues?.get(1)
             })
 
-            assertEquals(400, post(dash, "/api/tasks/job/schedule", "{\"expr\": \"garbage !\"}").statusCode())
-            assertEquals(404, post(dash, "/api/tasks/ghost/run").statusCode())
-            assertEquals(404, post(dash, "/api/tasks/job/explode").statusCode())
+            assertEquals(400, client.post("/api/tasks/job/schedule").json(mapOf("expr" to "garbage !")).send().status)
+            assertEquals(400, client.post("/api/tasks/job/schedule").send().status)
+            assertEquals(404, client.post("/api/tasks/ghost/run").send().status)
+            assertEquals(404, client.post("/api/tasks/job/explode").send().status)
 
-            assertEquals(200, post(dash, "/api/tasks/job/remove").statusCode())
+            assertEquals(200, client.post("/api/tasks/job/remove").send().status)
             assertFalse(tm.exists("job"))
         }
 
@@ -288,17 +279,18 @@ class DashboardTest {
         @DisplayName("schedule preview validates and projects fire times")
         fun previewValidates() {
             tm = scheduler()
-            val dash = startDashboard()
+            val client = client(dashboard())
 
-            val ok = get(dash, "/api/schedule/preview?expr=every%2030s")
-            assertEquals(200, ok.statusCode())
-            assertTrue(ok.body().contains("\"ok\":true"))
-            assertTrue(ok.body().contains("\"meaning\":\"every 30s\""))
-            assertTrue(Regex("\"next\":\\[\\d+,\\d+,\\d+]").containsMatchIn(ok.body())) { ok.body() }
+            val ok = client.get("/api/schedule/preview").query("expr", "every 30s").send()
+            assertEquals(200, ok.status)
+            val okBody = ok.text()!!
+            assertTrue(okBody.contains("\"ok\":true")) { okBody }
+            assertTrue(okBody.contains("\"meaning\":\"every 30s\"")) { okBody }
+            assertTrue(Regex("\"next\":\\[\\d+,\\d+,\\d+]").containsMatchIn(okBody)) { okBody }
 
-            val bad = get(dash, "/api/schedule/preview?expr=nope")
-            assertEquals(400, bad.statusCode())
-            assertTrue(bad.body().contains("\"ok\":false"))
+            val bad = client.get("/api/schedule/preview").query("expr", "nope").send()
+            assertEquals(400, bad.status)
+            assertTrue(bad.text()!!.contains("\"ok\":false"))
         }
 
         @Test
@@ -307,12 +299,12 @@ class DashboardTest {
             tm = scheduler()
             tm.task("good") { run { "ok" } }
             tm.task("bad") { run { error("boom") } }
-            val dash = startDashboard()
+            val client = client(dashboard())
 
             tm.runBlocking("good")
             tm.runBlocking("bad")
 
-            val body = get(dash, "/api/state").body()
+            val body = client.get("/api/state").send().text()!!
             assertTrue(body.contains("\"kind\":\"completed\"")) { body }
             assertTrue(body.contains("\"kind\":\"failed\"")) { body }
             assertTrue(body.contains("Failed: boom")) { body }
@@ -323,27 +315,59 @@ class DashboardTest {
         fun readOnlyRejectsMutations() {
             tm = scheduler()
             tm.task("job") { run { } }
-            val dash = startDashboard(readOnly = true)
+            val client = client(dashboard(readOnly = true))
 
-            assertEquals(403, post(dash, "/api/tasks/job/run").statusCode())
-            assertEquals(403, post(dash, "/api/tasks/job/pause").statusCode())
-            assertEquals(200, get(dash, "/api/state").statusCode())
+            assertEquals(403, client.post("/api/tasks/job/run").send().status)
+            assertEquals(403, client.post("/api/tasks/job/pause").send().status)
+            assertEquals(200, client.get("/api/state").send().status)
         }
 
         @Test
-        @DisplayName("stop() releases the port and detaches the listener")
-        fun stopReleasesPort() {
+        @DisplayName("mounts into a host Colleen application")
+        fun mountsIntoHostApp() {
+            tm = scheduler()
+            tm.task("demo") {
+                every(Duration.ofSeconds(30))
+                run { "ok" }
+            }
+            val host = Colleen()
+            host.get("/") { "host app" }
+            host.mount("/tasks", dashboard().app)
+            val client = TestClient(host)
+
+            assertEquals("host app", client.get("/").send().text())
+            val page = client.get("/tasks/").send()
+            assertEquals(200, page.status)
+            assertTrue(page.text()!!.contains("cleary"))
+            val state = client.get("/tasks/api/state").send()
+            assertEquals(200, state.status)
+            assertTrue(state.text()!!.contains("\"name\":\"demo\""))
+            assertEquals(200, client.post("/tasks/api/tasks/demo/pause").send().status)
+            assertFalse(tm.getTaskInfo("demo")!!.enabled)
+        }
+
+        @Test
+        @DisplayName("standalone start() serves over a real socket and stop() releases it")
+        fun standaloneStartStop() {
             tm = scheduler()
             tm.task("t") { run { "ok" } }
-            val dash = startDashboard()
-            val port = dash.port
+            val port = java.net.ServerSocket(0).use { it.localPort }
+            val dash = dashboard().start(port = port)
+
+            val http = HttpClient.newBuilder().proxy(java.net.ProxySelector.of(null)).build()
+            val response = http.send(
+                HttpRequest.newBuilder(URI.create("http://127.0.0.1:$port/api/state")).GET().build(),
+                HttpResponse.BodyHandlers.ofString()
+            )
+            assertEquals(200, response.statusCode())
+            assertTrue(response.body().contains("\"name\":\"t\""))
+
             dash.stop()
             dashboard = null
-
             assertThrows<Exception> {
-                client.send(
+                http.send(
                     HttpRequest.newBuilder(URI.create("http://127.0.0.1:$port/api/state"))
-                        .timeout(Duration.ofMillis(500)).GET().build(),
+                        .timeout(Duration.ofMillis(800)).GET().build(),
                     HttpResponse.BodyHandlers.ofString()
                 )
             }

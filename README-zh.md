@@ -47,7 +47,7 @@ DSL 提供，无需注解处理或反射。
 implementation("io.github.cymoo:cleary:0.3.0")
 ```
 
-Cleary 需要 **Java 11** 或更高版本。
+Cleary 需要 **Java 21** 或更高版本。
 
 > **从 0.2.x 升级？** 请阅读 [0.3.0 破坏性变更](#030-破坏性变更)。
 
@@ -489,18 +489,38 @@ tasks.remove("new-poller")
 
 ## Web Dashboard
 
-Cleary 内置了一个 Web 管理界面，由 JDK 自带的 HTTP 服务器提供——零额外依赖。
+Cleary 内置了一个基于 [Colleen](https://github.com/cymoo/colleen) 的 Web 管理界面。
 它实时展示调度器状态（概览计数、每个任务未来触发点的时间轴、以及完成/失败/重试/
 超时/跳过/拒绝的活动流），并支持在浏览器中手动运行、暂停/恢复、删除和修改排程
 （带实时表达式预览）。支持明暗主题。
+
+colleen 在 cleary 的 POM 中是 **optional** 依赖——使用 dashboard 需显式添加：
+
+```xml
+<dependency>
+    <groupId>io.github.cymoo</groupId>
+    <artifactId>colleen</artifactId>
+    <version>0.5.0</version>
+</dependency>
+```
+
+**独立运行**——dashboard 自己起服务：
 
 ```kotlin
 import io.github.cymoo.cleary.dashboard.Dashboard
 
 val dashboard = Dashboard(scheduler).start(port = 8378)
-println("Dashboard at http://localhost:${dashboard.port}")
 // ...
 dashboard.stop()
+```
+
+**嵌入集成**——作为子应用挂载进现有 Colleen 应用：
+
+```kotlin
+val app = Colleen()
+app.get("/") { "my app" }
+app.mount("/tasks", Dashboard(scheduler).app)
+app.listen(8000)   // dashboard 位于 http://localhost:8000/tasks/
 ```
 
 配置项：
@@ -509,7 +529,7 @@ dashboard.stop()
 Dashboard(scheduler) {
     eventHistoryLimit = 300   // 活动流保留条数
     readOnly = true           // 所有修改类端点返回 403
-}.start(port = 0)             // port 0 绑定随机端口，从 dashboard.port 读取
+}
 ```
 
 排程编辑器接受 `every <时长>`（`every 90s`、`every 1h30m`）、`fixed-delay <时长>`、
@@ -607,6 +627,7 @@ tasks.await()
 
 ## 0.3.0 破坏性变更
 
+- **要求 Java 21+**（此前为 11），与基于 Colleen 的 dashboard 及当前 LTS 对齐。
 - **时长**：自定义的 `5.seconds` / `1.hour` 扩展属性已删除。请使用
   `kotlin.time.Duration` 字面量（`import kotlin.time.Duration.Companion.seconds`）
   或 `java.time.Duration` 重载。`RetryPolicy` 与 `Schedule` 现在持有

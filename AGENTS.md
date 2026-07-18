@@ -10,7 +10,7 @@ with no annotation processing or reflection.
 
 - **Group ID / Artifact**: `io.github.cymoo:cleary`
 - **Current version**: `0.3.0`
-- **Minimum Java**: 11
+- **Minimum Java**: 21 (raised from 11 in 0.3.0 for the Colleen-based dashboard)
 - **Build tool**: Maven
 
 ## Repository Layout
@@ -30,10 +30,9 @@ cleary/
     │   ├── TaskBuilder.kt            # task DSL and RetryPolicy
     │   ├── Schedule.kt               # schedules, Trigger interface, trigger impls
     │   ├── TaskContext.kt            # per-execution context API
-    │   └── dashboard/                # built-in web dashboard (zero-dependency)
-    │       ├── Dashboard.kt          # embedded HTTP server + JSON API
-    │       ├── ScheduleExpr.kt       # textual schedule expressions
-    │       └── Json.kt               # minimal JSON writer
+    │   └── dashboard/                # built-in web dashboard (Colleen sub-app)
+    │       ├── Dashboard.kt          # routes + JSON API + standalone serving
+    │       └── ScheduleExpr.kt       # textual schedule expressions
     ├── main/resources/io/github/cymoo/cleary/dashboard/
     │   ├── index.html                # single-page UI (design shared with mita)
     │   └── styles.css
@@ -52,9 +51,8 @@ dashboard is the one subpackage:
 | `TaskBuilder.kt` | `TaskBuilder` DSL receiver (schedules, timeout, tags, per-task hooks) and `RetryPolicy` backoff calculation |
 | `Schedule.kt` | `Schedule` sealed class, public `Trigger` interface, cron/fixed-rate/fixed-delay/once/custom trigger implementations |
 | `TaskContext.kt` | `TaskContext` interface, reified typed accessors, copy-on-write per-execution implementation |
-| `dashboard/Dashboard.kt` | built-in web dashboard on the JDK `HttpServer` (zero deps): JSON API, action endpoints, event ring buffer via a lifecycle listener |
+| `dashboard/Dashboard.kt` | built-in web dashboard as a Colleen sub-app (`dashboard.app` is mountable via `host.mount(...)`; `start()` serves it standalone): JSON API, action endpoints, event ring buffer via a lifecycle listener |
 | `dashboard/ScheduleExpr.kt` | textual schedule expressions (`every 90s`, `fixed-delay 5m`, `once <iso>`, cron) — parse, canonical form, humanizer |
-| `dashboard/Json.kt` | minimal JSON writer + tiny field extractor (no serialization dependency) |
 | `src/main/resources/io/github/cymoo/cleary/dashboard/` | embedded `index.html` + `styles.css` (single-page UI shared with the mita project's design; polls `/api/state`) |
 | `examples/task-dashboard/` | thin runnable demo: registers showcase tasks and starts the built-in dashboard |
 
@@ -89,6 +87,7 @@ mvn deploy -P release
 |---|---|---|
 | `org.jetbrains.kotlin:kotlin-stdlib` | `2.3.0` | compile |
 | `com.cronutils:cron-utils` | `9.2.1` | compile — Quartz cron parsing |
+| `io.github.cymoo:colleen` | `0.5.0` | compile, **optional** — web dashboard only |
 | `org.jetbrains.kotlin:kotlin-test-junit5` | `2.3.0` | test |
 | `org.junit.jupiter:junit-jupiter` | `5.10.2` | test |
 
@@ -156,9 +155,13 @@ mvn deploy -P release
 - **Listeners vs hooks**: config hooks are single-slot; `TaskLifecycleListener`
   (via `addListener`) is the multicast path and fires after the hooks. The
   dashboard observes exclusively through a listener — never let it claim hooks.
-- **Dashboard**: `io.github.cymoo.cleary.dashboard` stays zero-dependency (JDK
-  `HttpServer`, hand-rolled JSON) and binds 127.0.0.1 without auth by design.
-  It reaches scheduler internals (`scheduleOf`, `upcomingFireTimes`,
-  `startedAtMillis`, `workerConcurrency`) through `internal` members — keep such
-  accessors internal, not public. Upcoming-fire projection is only exact for pure
-  grid triggers (fixed-rate, cron); never simulate stateful triggers (`Once`).
+- **Dashboard**: `io.github.cymoo.cleary.dashboard` is a Colleen application;
+  colleen is an **optional** dependency in the POM (core users without the
+  dashboard don't pull Undertow) — keep it optional, and keep the JSON payload
+  field names camelCase (Jackson defaults, mirrored in `index.html`).
+  `Dashboard.app` is the mountable sub-app; `start()`/`stop()` wrap standalone
+  serving. It binds 127.0.0.1 without auth by design. It reaches scheduler
+  internals (`scheduleOf`, `upcomingFireTimes`, `startedAtMillis`,
+  `workerConcurrency`) through `internal` members — keep such accessors
+  internal, not public. Upcoming-fire projection is only exact for pure grid
+  triggers (fixed-rate, cron); never simulate stateful triggers (`Once`).

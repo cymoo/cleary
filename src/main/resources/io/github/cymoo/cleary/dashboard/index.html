@@ -174,9 +174,9 @@
       text.textContent = "Unreachable";
       return;
     }
-    if (data && data.stats.started_at) {
+    if (data && data.stats.startedAt) {
       pill.className = "pill";
-      text.textContent = "Scheduler running · " + fmtUptime(now() - data.stats.started_at);
+      text.textContent = "Scheduler running · " + fmtUptime(now() - data.stats.startedAt);
     } else {
       pill.className = "pill stopped";
       text.textContent = "Scheduler not started";
@@ -209,14 +209,14 @@
   function renderOverview() {
     var s = data.stats;
     ovRefs.tasks.big.textContent = "";
-    ovRefs.tasks.big.appendChild(document.createTextNode(String(s.total_tasks)));
-    ovRefs.tasks.big.appendChild(h("span", "frac", " / " + s.enabled_tasks + " active"));
-    ovRefs.running.big.textContent = String(s.running_tasks);
-    ovRefs.running.ov.className = "ov" + (s.running_tasks > 0 ? " is-accent" : "");
-    ovRefs.runs.big.textContent = s.total_runs.toLocaleString();
-    ovRefs.errors.big.textContent = s.total_errors.toLocaleString();
-    ovRefs.errors.ov.className = "ov" + (s.total_errors > 0 ? " is-red" : "");
-    var rate = s.total_runs > 0 ? ((s.total_runs - s.total_errors) / s.total_runs) * 100 : 100;
+    ovRefs.tasks.big.appendChild(document.createTextNode(String(s.totalTasks)));
+    ovRefs.tasks.big.appendChild(h("span", "frac", " / " + s.enabledTasks + " active"));
+    ovRefs.running.big.textContent = String(s.runningTasks);
+    ovRefs.running.ov.className = "ov" + (s.runningTasks > 0 ? " is-accent" : "");
+    ovRefs.runs.big.textContent = s.totalRuns.toLocaleString();
+    ovRefs.errors.big.textContent = s.totalErrors.toLocaleString();
+    ovRefs.errors.ov.className = "ov" + (s.totalErrors > 0 ? " is-red" : "");
+    var rate = s.totalRuns > 0 ? ((s.totalRuns - s.totalErrors) / s.totalRuns) * 100 : 100;
     ovRefs.rate.big.textContent = "";
     ovRefs.rate.big.appendChild(document.createTextNode(rate.toFixed(1)));
     ovRefs.rate.big.appendChild(h("span", "frac", "%"));
@@ -325,27 +325,27 @@
 
   function updateRow(r) {
     var t = r.task, n = now();
-    var st = t.running ? "run" : !t.enabled ? "off" : (t.last_error ? "err" : "ok");
+    var st = t.running ? "run" : !t.enabled ? "off" : (t.lastError ? "err" : "ok");
     r.dot.className = "sdot " + st;
     r.root.className = "trow" + (selName === t.name ? " sel" : "") + (!t.enabled ? " paused" : "");
 
     // meta line
     r.meta.textContent = "";
-    r.meta.appendChild(document.createTextNode(t.meaning + " · " + t.run_count.toLocaleString() + " runs"));
-    if (t.error_count > 0) {
+    r.meta.appendChild(document.createTextNode(t.meaning + " · " + t.runCount.toLocaleString() + " runs"));
+    if (t.errorCount > 0) {
       r.meta.appendChild(document.createTextNode(" · "));
-      r.meta.appendChild(h("span", "er", t.error_count.toLocaleString() + " errors"));
+      r.meta.appendChild(h("span", "er", t.errorCount.toLocaleString() + " errors"));
     }
-    if (t.skip_count > 0) {
+    if (t.skipCount > 0) {
       r.meta.appendChild(document.createTextNode(" · "));
-      r.meta.appendChild(h("span", "sk", t.skip_count.toLocaleString() + " skips"));
+      r.meta.appendChild(h("span", "sk", t.skipCount.toLocaleString() + " skips"));
     }
 
     // countdown block
     if (t.running) {
       r.cd.className = "cd num running";
       r.cd.textContent = "Running · " + (t.lastMs ? fmtDur(Math.max(0, n - t.lastMs)) : "");
-      r.sub.textContent = t.running_count > 1 ? t.running_count + " instances" : "in flight";
+      r.sub.textContent = t.runningCount > 1 ? t.runningCount + " instances" : "in flight";
     } else if (!t.enabled) {
       r.cd.className = "cd num off";
       r.cd.textContent = "Paused";
@@ -460,7 +460,7 @@
       row.appendChild(h("span", "badge", EV_GLYPH[ev.kind] || "•"));
       row.appendChild(h("span", "nm" + (ev.task ? "" : " sys"), ev.task || "scheduler"));
       row.appendChild(h("span", "msg", ev.message));
-      row.appendChild(h("span", "dur num", ev.duration_ms > 0 ? fmtDur(ev.duration_ms) : ""));
+      row.appendChild(h("span", "dur num", ev.durationMs > 0 ? fmtDur(ev.durationMs) : ""));
       root.appendChild(row);
     });
   }
@@ -622,7 +622,7 @@
     if (!t) { closeDrawer(); return; }
     var n = now();
 
-    var st = t.running ? "run" : !t.enabled ? "off" : (t.last_error ? "err" : "ok");
+    var st = t.running ? "run" : !t.enabled ? "off" : (t.lastError ? "err" : "ok");
     dw.dot.className = "sdot " + st;
 
     dw.stateLine.textContent = "";
@@ -666,28 +666,28 @@
     }
 
     // policy
-    dw.vTimeout.className = "v" + (t.timeout_ms > 0 ? "" : " soft");
-    dw.vTimeout.textContent = t.timeout_ms > 0 ? fmtDur(t.timeout_ms) : "none";
+    dw.vTimeout.className = "v" + (t.timeoutMs > 0 ? "" : " soft");
+    dw.vTimeout.textContent = t.timeoutMs > 0 ? fmtDur(t.timeoutMs) : "none";
     dw.vOverlap.className = "v soft";
-    dw.vOverlap.textContent = t.allow_overlapping ? "Allow parallel runs" : "Deny — skip if running";
+    dw.vOverlap.textContent = t.allowOverlapping ? "Allow parallel runs" : "Deny — skip if running";
     dw.vRetry.className = "v soft";
     dw.vRetry.textContent = t.retry || "none";
     dw.vTags.className = "v soft";
     dw.vTags.textContent = t.tags && t.tags.length ? t.tags.join(", ") : "—";
 
     // stats
-    dw.vExec.textContent = t.run_count.toLocaleString();
-    dw.vErr.className = "v" + (t.error_count > 0 ? " red" : " soft");
-    dw.vErr.textContent = t.error_count.toLocaleString();
-    dw.vSkip.className = "v" + (t.skip_count > 0 ? " amber" : " soft");
-    dw.vSkip.textContent = t.skip_count.toLocaleString();
-    dw.vRej.className = "v" + (t.rejected_count > 0 ? " red" : " soft");
-    dw.vRej.textContent = t.rejected_count.toLocaleString();
-    dw.vRate.textContent = t.run_count > 0 ? (((t.run_count - t.error_count) / t.run_count) * 100).toFixed(1) + "%" : "—";
+    dw.vExec.textContent = t.runCount.toLocaleString();
+    dw.vErr.className = "v" + (t.errorCount > 0 ? " red" : " soft");
+    dw.vErr.textContent = t.errorCount.toLocaleString();
+    dw.vSkip.className = "v" + (t.skipCount > 0 ? " amber" : " soft");
+    dw.vSkip.textContent = t.skipCount.toLocaleString();
+    dw.vRej.className = "v" + (t.rejectedCount > 0 ? " red" : " soft");
+    dw.vRej.textContent = t.rejectedCount.toLocaleString();
+    dw.vRate.textContent = t.runCount > 0 ? (((t.runCount - t.errorCount) / t.runCount) * 100).toFixed(1) + "%" : "—";
     dw.vLast.className = "v soft";
     dw.vLast.textContent = t.lastMs ? fmtRel(t.lastMs, n) : "never";
-    dw.errBox.style.display = t.last_error ? "" : "none";
-    dw.errBox.textContent = t.last_error;
+    dw.errBox.style.display = t.lastError ? "" : "none";
+    dw.errBox.textContent = t.lastError;
 
     // events
     var evs = (data.events || []).filter(function (ev) { return ev.task === t.name; }).slice(0, 7);
@@ -703,7 +703,7 @@
         row.appendChild(h("span", "t num", fmtTime(ev.atMs)));
         row.appendChild(h("span", "badge", EV_GLYPH[ev.kind] || "•"));
         row.appendChild(h("span", "msg", ev.message));
-        row.appendChild(h("span", "dur num", ev.duration_ms > 0 ? fmtDur(ev.duration_ms) : ""));
+        row.appendChild(h("span", "dur num", ev.durationMs > 0 ? fmtDur(ev.durationMs) : ""));
         dw.evList.appendChild(row);
       });
     }
@@ -856,8 +856,8 @@
   /* ---------------- poll & tick ---------------- */
   function parsePayload(j) {
     j.tasks.forEach(function (t) {
-      t.nextMs = t.next_run || 0;
-      t.lastMs = t.last_run || 0;
+      t.nextMs = t.nextRun || 0;
+      t.lastMs = t.lastRun || 0;
       t.upcomingMs = t.upcoming || [];
     });
     (j.events || []).forEach(function (ev) { ev.atMs = ev.at; });

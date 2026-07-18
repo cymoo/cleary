@@ -1,5 +1,7 @@
 import io.github.cymoo.cleary.dashboard.Dashboard
 import io.github.cymoo.cleary.taskScheduler
+import io.github.cymoo.colleen.Colleen
+import io.github.cymoo.colleen.middleware.RequestLogger
 import java.time.Instant
 import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.atomic.AtomicInteger
@@ -8,12 +10,15 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
- * Demo for Cleary's built-in web dashboard: a handful of tasks exercising
- * fixed-rate, fixed-delay, cron, one-shot, retry, timeout, and manual-only
- * scheduling, all monitored and controlled from the browser.
+ * Demo for Cleary's built-in web dashboard, mounted into a host Colleen
+ * application: a handful of tasks exercising fixed-rate, fixed-delay, cron,
+ * one-shot, retry, timeout, and manual-only scheduling.
  *
- * Run with `mvn compile exec:java`, then open http://localhost:8000
+ * Run with `mvn compile exec:java`, then open http://localhost:8000/tasks/
  * (override the port with -Dport=NNNN or PORT).
+ *
+ * For a dashboard-only process, `Dashboard(scheduler).start(port)` serves the
+ * same app standalone without a host application.
  */
 fun main() {
     val scheduler = taskScheduler {
@@ -22,6 +27,39 @@ fun main() {
         registerShutdownHook = true
     }
 
+    registerDemoTasks(scheduler)
+    scheduler.start()
+
+    // A regular Colleen application with its own routes …
+    val app = Colleen()
+    app.use(RequestLogger())
+    app.get("/") { ctx ->
+        ctx.html(
+            """
+            <!DOCTYPE html>
+            <html>
+            <head><title>Demo app</title></head>
+            <body style="font-family: sans-serif; max-width: 640px; margin: 60px auto;">
+              <h1>Host application</h1>
+              <p>This is an ordinary Colleen app with the Cleary dashboard mounted as a sub-app.</p>
+              <p>➡ <a href="/tasks/">Open the task dashboard</a></p>
+            </body>
+            </html>
+            """.trimIndent()
+        )
+    }
+
+    // … with the Cleary dashboard mounted as a sub-application.
+    app.mount("/tasks", Dashboard(scheduler).app)
+
+    app.onShutdown { scheduler.shutdown() }
+
+    val port = dashboardPort()
+    app.listen(port)
+    println("Demo app running at http://localhost:$port — dashboard at http://localhost:$port/tasks/")
+}
+
+private fun registerDemoTasks(scheduler: io.github.cymoo.cleary.TaskScheduler) {
     val flakyAttempts = AtomicInteger(0)
     val rollupCursor = AtomicLong(40)
     val reportNumber = AtomicInteger(0)
@@ -99,13 +137,6 @@ fun main() {
             mapOf("cache" to "edge-metadata", "status" to "flushed")
         }
     }
-
-    scheduler.start()
-
-    val dashboard = Dashboard(scheduler).start(port = dashboardPort())
-    println("Cleary dashboard running at http://localhost:${dashboard.port}")
-
-    scheduler.await()
 }
 
 private fun dashboardPort(): Int {
